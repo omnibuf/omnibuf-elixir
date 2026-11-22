@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 omnibuf = { version = "0.1.2", default-features = false }
-rustler = "0.36"
+rustler = "0.39"
 
 [profile.release]
 lto = "thin"
