@@ -123,7 +123,7 @@ pub struct CompiledSchema {
 unsafe impl Send for CompiledSchema {}
 unsafe impl Sync for CompiledSchema {}
 
-#[rustler::resource_impl]
+#[rustler::resource_impl(register = false)]
 impl rustler::Resource for CompiledSchema {}
 
 #[derive(Debug)]

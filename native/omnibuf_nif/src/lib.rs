@@ -77,8 +77,8 @@ pub mod atoms {
     }
 }
 
-fn on_load(_env: Env, _info: Term) -> bool {
-    true
+fn on_load(env: Env, _info: Term) -> bool {
+    env.register::<CompiledSchema>().is_ok()
 }
 
 #[inline]
