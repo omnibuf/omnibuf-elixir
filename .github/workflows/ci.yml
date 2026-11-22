@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install tools via mise
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v5
         with:
           install: true
 
@@ -37,4 +37,11 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run full CI suite
-        run: just ci
+        run: |
+          just fmt-check
+          just lint
+          just build
+          OMNIBUF_NATIVE=0 mix test --trace
+          OMNIBUF_NATIVE=1 mix test --trace
+          OMNIBUF_NATIVE=0 just conformance
+          OMNIBUF_NATIVE=1 just conformance
