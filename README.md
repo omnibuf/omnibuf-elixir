@@ -93,7 +93,11 @@ Inspect any OmniBuf packet with no compiled schema. Declared Field #0 names prop
 {:ok, json} = OmniBuf.decode_blind_json(wire)
 ```
 
-## Conformance & Benchmarks
+## Benchmarks
+
+Elixir benchmark results, methodology, and cross-language comparisons live at [omnibuf.com/benchmarks?lang=elixir](https://omnibuf.com/benchmarks?lang=elixir) (all languages at [omnibuf.com/benchmarks](https://omnibuf.com/benchmarks)). Run `just bench` locally to regenerate [`testdata/benchmarks.json`](testdata/benchmarks.json).
+
+## Conformance & Development
 
 ```bash
 just fmt-check
