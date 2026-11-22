@@ -1,0 +1,180 @@
+{
+  "arch": "arm64",
+  "categories": [
+    {
+      "id": "encode",
+      "results": [
+        {
+          "highlight": true,
+          "name": "OmniBuf (Schema DSL)",
+          "nsPerOp": 2672,
+          "opsPerSec": 374251,
+          "wireBytes": 358
+        },
+        {
+          "baseline": true,
+          "highlight": true,
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 2698,
+          "opsPerSec": 370644,
+          "wireBytes": 358
+        },
+        {
+          "name": "Jason (JSON)",
+          "nsPerOp": 6382,
+          "opsPerSec": 156690,
+          "wireBytes": 803
+        },
+        {
+          "name": "elixir-protobuf",
+          "nsPerOp": 7547,
+          "opsPerSec": 132502,
+          "wireBytes": 341
+        }
+      ],
+      "title": "Full Message Encode Speed",
+      "unit": "ns"
+    },
+    {
+      "id": "decode",
+      "results": [
+        {
+          "highlight": true,
+          "name": "OmniBuf (Schema DSL)",
+          "nsPerOp": 4604,
+          "opsPerSec": 217202
+        },
+        {
+          "baseline": true,
+          "highlight": true,
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 4616,
+          "opsPerSec": 216637
+        },
+        {
+          "name": "elixir-protobuf",
+          "nsPerOp": 5549,
+          "opsPerSec": 180212
+        },
+        {
+          "name": "Jason (JSON)",
+          "nsPerOp": 7587,
+          "opsPerSec": 131804
+        }
+      ],
+      "title": "Full Message Decode Speed",
+      "unit": "ns"
+    },
+    {
+      "id": "lookup_city",
+      "results": [
+        {
+          "baseline": true,
+          "highlight": true,
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 1710,
+          "opsPerSec": 584795
+        },
+        {
+          "name": "elixir-protobuf",
+          "nsPerOp": 5660,
+          "opsPerSec": 176678
+        },
+        {
+          "name": "Jason (JSON)",
+          "nsPerOp": 7727,
+          "opsPerSec": 129416
+        }
+      ],
+      "title": "Read a Single Nested Field",
+      "unit": "ns"
+    },
+    {
+      "id": "mutate_sequence",
+      "results": [
+        {
+          "baseline": true,
+          "highlight": true,
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 2420,
+          "opsPerSec": 413223
+        },
+        {
+          "name": "elixir-protobuf",
+          "nsPerOp": 13460,
+          "opsPerSec": 74294
+        },
+        {
+          "name": "Jason (JSON)",
+          "nsPerOp": 14419,
+          "opsPerSec": 69352
+        }
+      ],
+      "title": "Selective Single-Field Mutation",
+      "unit": "ns"
+    },
+    {
+      "id": "encode_nested_shift",
+      "results": [
+        {
+          "baseline": true,
+          "highlight": true,
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 3470,
+          "opsPerSec": 288184,
+          "wireBytes": 39250
+        },
+        {
+          "highlight": true,
+          "name": "OmniBuf (Schema DSL)",
+          "nsPerOp": 3509,
+          "opsPerSec": 284981,
+          "wireBytes": 39250
+        },
+        {
+          "name": "Jason (JSON)",
+          "nsPerOp": 106321,
+          "opsPerSec": 9405,
+          "wireBytes": 39681
+        },
+        {
+          "name": "elixir-protobuf",
+          "nsPerOp": 138489,
+          "opsPerSec": 7220,
+          "wireBytes": 39227
+        }
+      ],
+      "title": "Large Embedded Message Encode",
+      "unit": "ns"
+    },
+    {
+      "id": "mutate_embedded_grow",
+      "results": [
+        {
+          "baseline": true,
+          "highlight": true,
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 7751,
+          "opsPerSec": 129015
+        },
+        {
+          "name": "Jason (JSON)",
+          "nsPerOp": 119017,
+          "opsPerSec": 8402
+        },
+        {
+          "name": "elixir-protobuf",
+          "nsPerOp": 136718,
+          "opsPerSec": 7314
+        }
+      ],
+      "title": "Embedded Message Growth",
+      "unit": "ns"
+    }
+  ],
+  "cpu": "Apple M1 Pro",
+  "language": "elixir",
+  "platform": "darwin",
+  "runtime": "Elixir 1.18.6 (OTP 27)",
+  "workload": "PeerUpdate"
+}

@@ -1,0 +1,78 @@
+name: Release & Publish to Hex.pm
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, Verify & Publish to Hex.pm
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install tools via mise
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+
+      - name: Sync mix.exs version with release tag
+        run: |
+          RAW_TAG="${GITHUB_REF_NAME:-}"
+          VERSION="${RAW_TAG#v}"
+          if [[ -n "$VERSION" && "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Syncing mix.exs version to $VERSION"
+            python3 - "$VERSION" <<'PY'
+          import re, pathlib, sys
+          ver = sys.argv[1]
+          p = pathlib.Path("mix.exs")
+          txt = p.read_text()
+          txt = re.sub(r'(?m)^  @version "[^"]+"', f'  @version "{ver}"', txt, count=1)
+          p.write_text(txt)
+          PY
+          fi
+
+      - name: Install Hex, Rebar & fetch dependencies
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+
+      - name: Install conformance-runner
+        run: |
+          mise use -g go@1.25
+          GOBIN="$HOME/.local/bin" mise exec -- go install github.com/omnibuf/omnibuf-go/cmd/conformance-runner@71dad83aadd7dc65401d662521d34cfaeb1011ab
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run full CI and documentation checks
+        run: |
+          just ci
+          mix docs
+          mix hex.build
+
+      - name: Publish package to Hex.pm
+        if: ${{ env.HEX_API_KEY != '' }}
+        run: mix hex.publish --yes
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" ./protoc-gen-omnibuf-elixir --title "omnibuf-elixir $TAG" --generate-notes
+          fi

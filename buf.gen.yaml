@@ -1,0 +1,5 @@
+version: v2
+plugins:
+  - local: ./protoc-gen-omnibuf-elixir
+    out: lib/generated
+    strategy: all
