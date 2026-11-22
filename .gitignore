@@ -16,3 +16,7 @@ erl_crash.dump
 /conformance-elixir
 /protoc-gen-omnibuf-elixir
 /bin/
+
+# Optional Rust NIF build artifacts
+/native/omnibuf_nif/target/
+/priv/native/

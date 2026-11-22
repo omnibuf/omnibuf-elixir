@@ -8,7 +8,7 @@ defmodule OmniBuf.Blind do
   falling back to `"field_<N>"` for unnamed fields.
   """
 
-  alias OmniBuf.{Error, SchemaMeta, Wire}
+  alias OmniBuf.{Error, Native, SchemaMeta, Wire}
 
   @default_max_bytes 64 * 1024 * 1024
   @default_max_elements 4_194_304
@@ -25,8 +25,15 @@ defmodule OmniBuf.Blind do
   """
   @spec decode(binary(), keyword()) :: {:ok, map()} | {:error, Error.t()}
   def decode(bin, opts \\ []) when is_binary(bin) do
-    with {:ok, raw_map} <- decode_raw(bin, opts) do
-      {:ok, unwrap_public(raw_map)}
+    if Native.enabled?() and is_nil(Keyword.get(opts, :inherited_schema)) do
+      max_bytes = Keyword.get(opts, :max_message_bytes, @default_max_bytes)
+      max_depth = min(Keyword.get(opts, :max_depth, Wire.max_depth()), Wire.max_depth())
+      max_elements = Keyword.get(opts, :max_elements, @default_max_elements)
+      Native.decode_blind(bin, max_depth, max_elements, max_bytes)
+    else
+      with {:ok, raw_map} <- decode_raw(bin, opts) do
+        {:ok, unwrap_public(raw_map)}
+      end
     end
   end
 
@@ -63,11 +70,18 @@ defmodule OmniBuf.Blind do
   """
   @spec decode_json(binary(), keyword()) :: {:ok, String.t()} | {:error, Error.t()}
   def decode_json(bin, opts \\ []) when is_binary(bin) do
-    with {:ok, map} <- decode_raw(bin, opts),
-         {:ok, json_ready} <- to_json_value(map) do
-      case Jason.encode(json_ready) do
-        {:ok, json} -> {:ok, json}
-        {:error, err} -> {:error, Error.new(:serialize, Exception.message(err))}
+    if Native.enabled?() and is_nil(Keyword.get(opts, :inherited_schema)) do
+      max_bytes = Keyword.get(opts, :max_message_bytes, @default_max_bytes)
+      max_depth = min(Keyword.get(opts, :max_depth, Wire.max_depth()), Wire.max_depth())
+      max_elements = Keyword.get(opts, :max_elements, @default_max_elements)
+      Native.decode_blind_json(bin, max_depth, max_elements, max_bytes)
+    else
+      with {:ok, map} <- decode_raw(bin, opts),
+           {:ok, json_ready} <- to_json_value(map) do
+        case Jason.encode(json_ready) do
+          {:ok, json} -> {:ok, json}
+          {:error, err} -> {:error, Error.new(:serialize, Exception.message(err))}
+        end
       end
     end
   end

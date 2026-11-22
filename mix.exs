@@ -10,6 +10,7 @@ defmodule OmniBuf.MixProject do
       version: @version,
       elixir: "~> 1.17",
       elixirc_paths: elixirc_paths(Mix.env()),
+      compilers: Mix.compilers() ++ [:omnibuf_nif],
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       escript: escript(),

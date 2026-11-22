@@ -79,7 +79,7 @@ defmodule OmniBuf.Bench.PeerBench do
     }
 
     gen_shift_bytes = PeerUpdate.encode(gen_shift)
-    schema_shift_bytes = S.PeerUpdate.encode(schema_shift)
+    ^gen_shift_bytes = S.PeerUpdate.encode(schema_shift)
     pb_shift_bytes = PB.PeerUpdate.encode(pb_shift)
     json_shift_bytes = Jason.encode!(json_shift)
 
@@ -107,104 +107,222 @@ defmodule OmniBuf.Bench.PeerBench do
 
     IO.puts("OmniBuf Elixir Benchmark Suite")
     IO.puts("Runtime: #{runtime} | Platform: #{platform}/#{arch} | CPU: #{cpu}")
+    native_loaded? = OmniBuf.Native.loaded?()
+    IO.puts("Rust NIF available: #{native_loaded?}")
+
+    if native_loaded? do
+      OmniBuf.Native.set_enabled(true)
+      ^omnibuf_bytes = PeerUpdate.encode(gen_msg)
+      {:ok, ^decoded_gen} = PeerUpdate.decode(omnibuf_bytes)
+
+      ^spliced =
+        omnibuf_bytes
+        |> PeerUpdate.Opaque.new()
+        |> PeerUpdate.Opaque.set_sequence(9_876_543_211)
+        |> PeerUpdate.Opaque.marshal!()
+    end
 
     categories = [
-      build_category("encode", "Full Message Encode Speed", [
-        measure("OmniBuf (Generated)", byte_size(omnibuf_bytes), true, true, fn ->
-          PeerUpdate.encode(gen_msg)
-        end),
-        measure("OmniBuf (Schema DSL)", byte_size(schema_bytes), true, false, fn ->
-          S.PeerUpdate.encode(schema_msg)
-        end),
-        measure("elixir-protobuf", byte_size(pb_bytes), false, false, fn ->
-          PB.PeerUpdate.encode(pb_msg)
-        end),
-        measure("Jason (JSON)", byte_size(json_bytes), false, false, fn ->
-          Jason.encode!(json_map)
-        end)
-      ]),
-      build_category("decode", "Full Message Decode Speed", [
-        measure("OmniBuf (Generated)", nil, true, true, fn ->
-          {:ok, _} = PeerUpdate.decode(omnibuf_bytes)
-        end),
-        measure("OmniBuf (Schema DSL)", nil, true, false, fn ->
-          {:ok, _} = S.PeerUpdate.decode(schema_bytes)
-        end),
-        measure("elixir-protobuf", nil, false, false, fn ->
-          PB.PeerUpdate.decode(pb_bytes)
-        end),
-        measure("Jason (JSON)", nil, false, false, fn ->
-          Jason.decode!(json_bytes)
-        end)
-      ]),
-      build_category("lookup_city", "Read a Single Nested Field", [
-        measure("OmniBuf (Generated)", nil, true, true, fn ->
-          omnibuf_bytes
-          |> PeerUpdate.Opaque.new()
-          |> PeerUpdate.Opaque.get_location()
-          |> Location.Opaque.get_city()
-        end),
-        measure("elixir-protobuf", nil, false, false, fn ->
-          PB.PeerUpdate.decode(pb_bytes).location.city
-        end),
-        measure("Jason (JSON)", nil, false, false, fn ->
-          Jason.decode!(json_bytes)["location"]["city"]
-        end)
-      ]),
-      build_category("mutate_sequence", "Selective Single-Field Mutation", [
-        measure("OmniBuf (Generated)", nil, true, true, fn ->
-          view = PeerUpdate.Opaque.new(omnibuf_bytes)
-          seq = PeerUpdate.Opaque.get_sequence(view) + 1
-          view |> PeerUpdate.Opaque.set_sequence(seq) |> PeerUpdate.Opaque.marshal!()
-        end),
-        measure("elixir-protobuf", nil, false, false, fn ->
-          m = PB.PeerUpdate.decode(pb_bytes)
-          PB.PeerUpdate.encode(%{m | sequence: m.sequence + 1})
-        end),
-        measure("Jason (JSON)", nil, false, false, fn ->
-          m = Jason.decode!(json_bytes)
-          Jason.encode!(%{m | "sequence" => m["sequence"] + 1})
-        end)
-      ]),
-      build_category("encode_nested_shift", "Large Embedded Message Encode", [
-        measure("OmniBuf (Generated)", byte_size(gen_shift_bytes), true, true, fn ->
-          PeerUpdate.encode(gen_shift)
-        end),
-        measure("OmniBuf (Schema DSL)", byte_size(schema_shift_bytes), true, false, fn ->
-          S.PeerUpdate.encode(schema_shift)
-        end),
-        measure("elixir-protobuf", byte_size(pb_shift_bytes), false, false, fn ->
-          PB.PeerUpdate.encode(pb_shift)
-        end),
-        measure("Jason (JSON)", byte_size(json_shift_bytes), false, false, fn ->
-          Jason.encode!(json_shift)
-        end)
-      ]),
-      build_category("mutate_embedded_grow", "Embedded Message Growth", [
-        measure("OmniBuf (Generated)", nil, true, true, fn ->
-          view = PeerUpdate.Opaque.new(routing_omnibuf_bytes)
-          lv = PeerUpdate.Opaque.get_location(view)
+      build_category(
+        "encode",
+        "Full Message Encode Speed",
+        maybe_native(native_loaded?, fn ->
+          measure_mode(true, "OmniBuf (Rust NIF)", byte_size(omnibuf_bytes), true, true, fn ->
+            PeerUpdate.encode(gen_msg)
+          end)
+        end) ++
+          [
+            measure_mode(
+              false,
+              "OmniBuf (Pure Elixir)",
+              byte_size(omnibuf_bytes),
+              true,
+              not native_loaded?,
+              fn ->
+                PeerUpdate.encode(gen_msg)
+              end
+            ),
+            measure("elixir-protobuf", byte_size(pb_bytes), false, false, fn ->
+              PB.PeerUpdate.encode(pb_msg)
+            end),
+            measure("Jason (JSON)", byte_size(json_bytes), false, false, fn ->
+              Jason.encode!(json_map)
+            end)
+          ]
+      ),
+      build_category(
+        "decode",
+        "Full Message Decode Speed",
+        maybe_native(native_loaded?, fn ->
+          measure_mode(true, "OmniBuf (Rust NIF)", nil, true, true, fn ->
+            {:ok, _} = PeerUpdate.decode(omnibuf_bytes)
+          end)
+        end) ++
+          [
+            measure_mode(
+              false,
+              "OmniBuf (Pure Elixir)",
+              nil,
+              true,
+              not native_loaded?,
+              fn ->
+                {:ok, _} = PeerUpdate.decode(omnibuf_bytes)
+              end
+            ),
+            measure("elixir-protobuf", nil, false, false, fn ->
+              PB.PeerUpdate.decode(pb_bytes)
+            end),
+            measure("Jason (JSON)", nil, false, false, fn ->
+              Jason.decode!(json_bytes)
+            end)
+          ]
+      ),
+      build_category(
+        "lookup_city",
+        "Read a Single Nested Field",
+        maybe_native(native_loaded?, fn ->
+          measure_mode(true, "OmniBuf (Rust NIF)", nil, true, true, fn ->
+            omnibuf_bytes
+            |> PeerUpdate.Opaque.new()
+            |> PeerUpdate.Opaque.get_location()
+            |> Location.Opaque.get_city()
+          end)
+        end) ++
+          [
+            measure_mode(
+              false,
+              "OmniBuf (Pure Elixir)",
+              nil,
+              true,
+              not native_loaded?,
+              fn ->
+                omnibuf_bytes
+                |> PeerUpdate.Opaque.new()
+                |> PeerUpdate.Opaque.get_location()
+                |> Location.Opaque.get_city()
+              end
+            ),
+            measure("elixir-protobuf", nil, false, false, fn ->
+              PB.PeerUpdate.decode(pb_bytes).location.city
+            end),
+            measure("Jason (JSON)", nil, false, false, fn ->
+              Jason.decode!(json_bytes)["location"]["city"]
+            end)
+          ]
+      ),
+      build_category(
+        "mutate_sequence",
+        "Selective Single-Field Mutation",
+        maybe_native(native_loaded?, fn ->
+          measure_mode(true, "OmniBuf (Rust NIF)", nil, true, true, fn ->
+            view = PeerUpdate.Opaque.new(omnibuf_bytes)
+            seq = PeerUpdate.Opaque.get_sequence(view) + 1
+            view |> PeerUpdate.Opaque.set_sequence(seq) |> PeerUpdate.Opaque.marshal!()
+          end)
+        end) ++
+          [
+            measure_mode(
+              false,
+              "OmniBuf (Pure Elixir)",
+              nil,
+              true,
+              not native_loaded?,
+              fn ->
+                view = PeerUpdate.Opaque.new(omnibuf_bytes)
+                seq = PeerUpdate.Opaque.get_sequence(view) + 1
+                view |> PeerUpdate.Opaque.set_sequence(seq) |> PeerUpdate.Opaque.marshal!()
+              end
+            ),
+            measure("elixir-protobuf", nil, false, false, fn ->
+              m = PB.PeerUpdate.decode(pb_bytes)
+              PB.PeerUpdate.encode(%{m | sequence: m.sequence + 1})
+            end),
+            measure("Jason (JSON)", nil, false, false, fn ->
+              m = Jason.decode!(json_bytes)
+              Jason.encode!(%{m | "sequence" => m["sequence"] + 1})
+            end)
+          ]
+      ),
+      build_category(
+        "encode_nested_shift",
+        "Large Embedded Message Encode",
+        maybe_native(native_loaded?, fn ->
+          measure_mode(true, "OmniBuf (Rust NIF)", byte_size(gen_shift_bytes), true, true, fn ->
+            PeerUpdate.encode(gen_shift)
+          end)
+        end) ++
+          [
+            measure_mode(
+              false,
+              "OmniBuf (Pure Elixir)",
+              byte_size(gen_shift_bytes),
+              true,
+              not native_loaded?,
+              fn ->
+                PeerUpdate.encode(gen_shift)
+              end
+            ),
+            measure("elixir-protobuf", byte_size(pb_shift_bytes), false, false, fn ->
+              PB.PeerUpdate.encode(pb_shift)
+            end),
+            measure("Jason (JSON)", byte_size(json_shift_bytes), false, false, fn ->
+              Jason.encode!(json_shift)
+            end)
+          ]
+      ),
+      build_category(
+        "mutate_embedded_grow",
+        "Embedded Message Growth",
+        maybe_native(native_loaded?, fn ->
+          measure_mode(true, "OmniBuf (Rust NIF)", nil, true, true, fn ->
+            view = PeerUpdate.Opaque.new(routing_omnibuf_bytes)
+            lv = PeerUpdate.Opaque.get_location(view)
 
-          new_loc = %Location{
-            region: Location.Opaque.get_region(lv),
-            datacenter: grown_dc,
-            city: Location.Opaque.get_city(lv),
-            rack: Location.Opaque.get_rack(lv),
-            latitude: Location.Opaque.get_latitude(lv),
-            longitude: Location.Opaque.get_longitude(lv)
-          }
+            new_loc = %Location{
+              region: Location.Opaque.get_region(lv),
+              datacenter: grown_dc,
+              city: Location.Opaque.get_city(lv),
+              rack: Location.Opaque.get_rack(lv),
+              latitude: Location.Opaque.get_latitude(lv),
+              longitude: Location.Opaque.get_longitude(lv)
+            }
 
-          view |> PeerUpdate.Opaque.set_location(new_loc) |> PeerUpdate.Opaque.marshal!()
-        end),
-        measure("elixir-protobuf", nil, false, false, fn ->
-          m = PB.PeerUpdate.decode(routing_pb_bytes)
-          PB.PeerUpdate.encode(%{m | location: %{m.location | datacenter: grown_dc}})
-        end),
-        measure("Jason (JSON)", nil, false, false, fn ->
-          m = Jason.decode!(routing_json_bytes)
-          Jason.encode!(%{m | "location" => %{m["location"] | "datacenter" => grown_dc}})
-        end)
-      ])
+            view |> PeerUpdate.Opaque.set_location(new_loc) |> PeerUpdate.Opaque.marshal!()
+          end)
+        end) ++
+          [
+            measure_mode(
+              false,
+              "OmniBuf (Pure Elixir)",
+              nil,
+              true,
+              not native_loaded?,
+              fn ->
+                view = PeerUpdate.Opaque.new(routing_omnibuf_bytes)
+                lv = PeerUpdate.Opaque.get_location(view)
+
+                new_loc = %Location{
+                  region: Location.Opaque.get_region(lv),
+                  datacenter: grown_dc,
+                  city: Location.Opaque.get_city(lv),
+                  rack: Location.Opaque.get_rack(lv),
+                  latitude: Location.Opaque.get_latitude(lv),
+                  longitude: Location.Opaque.get_longitude(lv)
+                }
+
+                view |> PeerUpdate.Opaque.set_location(new_loc) |> PeerUpdate.Opaque.marshal!()
+              end
+            ),
+            measure("elixir-protobuf", nil, false, false, fn ->
+              m = PB.PeerUpdate.decode(routing_pb_bytes)
+              PB.PeerUpdate.encode(%{m | location: %{m.location | datacenter: grown_dc}})
+            end),
+            measure("Jason (JSON)", nil, false, false, fn ->
+              m = Jason.decode!(routing_json_bytes)
+              Jason.encode!(%{m | "location" => %{m["location"] | "datacenter" => grown_dc}})
+            end)
+          ]
+      )
     ]
 
     Enum.each(categories, &print_category/1)
@@ -222,6 +340,14 @@ defmodule OmniBuf.Bench.PeerBench do
     File.mkdir_p!("testdata")
     File.write!("testdata/benchmarks.json", Jason.encode!(report, pretty: true) <> "\n")
     IO.puts("\nWrote testdata/benchmarks.json")
+  end
+
+  defp maybe_native(true, fun), do: [fun.()]
+  defp maybe_native(false, _fun), do: []
+
+  defp measure_mode(native?, name, wire_bytes, highlight, baseline, fun) do
+    :ok = OmniBuf.Native.set_enabled(native?)
+    measure(name, wire_bytes, highlight, baseline, fun)
   end
 
   defp build_category(id, title, results) do

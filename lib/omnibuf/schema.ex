@@ -116,19 +116,39 @@ defmodule OmniBuf.Schema do
       Pass `self_describing: true` to prepend Field #0 `SchemaMeta`.
       """
       def encode(%__MODULE__{} = msg, opts \\ []) do
-        IO.iodata_to_binary(encode_iodata(msg, opts))
+        if OmniBuf.Native.enabled?() do
+          body = OmniBuf.Native.encode_struct(__MODULE__, msg)
+
+          if Keyword.get(opts, :self_describing, false) do
+            IO.iodata_to_binary([SchemaMeta.encode_field(schema_meta_for(msg, 1)), body])
+          else
+            body
+          end
+        else
+          IO.iodata_to_binary(encode_iodata(msg, opts))
+        end
       end
 
       @doc """
       Encodes the struct into iodata (single-pass forward encoding).
       """
       def encode_iodata(%__MODULE__{} = msg, opts \\ []) do
-        body = [unquote_splicing(encode_exprs)]
+        if OmniBuf.Native.enabled?() do
+          body = OmniBuf.Native.encode_struct(__MODULE__, msg)
 
-        if Keyword.get(opts, :self_describing, false) do
-          [SchemaMeta.encode_field(schema_meta_for(msg, 1)), body]
+          if Keyword.get(opts, :self_describing, false) do
+            [SchemaMeta.encode_field(schema_meta_for(msg, 1)), body]
+          else
+            body
+          end
         else
-          body
+          body = [unquote_splicing(encode_exprs)]
+
+          if Keyword.get(opts, :self_describing, false) do
+            [SchemaMeta.encode_field(schema_meta_for(msg, 1)), body]
+          else
+            body
+          end
         end
       end
 
@@ -136,14 +156,22 @@ defmodule OmniBuf.Schema do
       Decodes an OmniBuf binary into a fresh `%#{inspect(__MODULE__)}{}` struct (replace mode).
       """
       def decode(bin) when is_binary(bin) do
-        decode_into(bin, %__MODULE__{}, 0)
+        if OmniBuf.Native.enabled?() do
+          OmniBuf.Native.decode_struct(__MODULE__, bin)
+        else
+          decode_into(bin, %__MODULE__{}, 0)
+        end
       end
 
       @doc """
       Merges an OmniBuf binary onto an existing `%#{inspect(__MODULE__)}{}` struct (merge mode).
       """
       def merge(%__MODULE__{} = existing, bin) when is_binary(bin) do
-        decode_into(bin, existing, 0)
+        if OmniBuf.Native.enabled?() do
+          OmniBuf.Native.merge_struct(__MODULE__, existing, bin)
+        else
+          decode_into(bin, existing, 0)
+        end
       end
 
       @doc false

@@ -6,7 +6,7 @@ defmodule OmniBuf.Opaque do
   until the final `IO.iodata_to_binary/1` call.
   """
 
-  alias OmniBuf.{Error, Wire}
+  alias OmniBuf.{Error, Native, Wire}
 
   @doc """
   Scans `bin` in O(fields) time and returns the raw value binary (starting right after
@@ -18,7 +18,11 @@ defmodule OmniBuf.Opaque do
   @spec find_last(binary(), non_neg_integer(), 0..15 | :bool) ::
           {:ok, {:found, 0..15, binary()} | :not_found} | {:error, Error.t()}
   def find_last(bin, target_field, target_wt) when is_binary(bin) do
-    scan_last(bin, target_field, target_wt, :not_found)
+    if Native.enabled?() do
+      Native.opaque_find_last(bin, target_field, target_wt)
+    else
+      scan_last(bin, target_field, target_wt, :not_found)
+    end
   end
 
   defp scan_last(<<>>, _target_field, _target_wt, found), do: {:ok, found}
@@ -50,7 +54,11 @@ defmodule OmniBuf.Opaque do
   @spec find_all(binary(), non_neg_integer(), 0..15 | :bool) ::
           {:ok, [{0..15, binary()}]} | {:error, Error.t()}
   def find_all(bin, target_field, target_wt) when is_binary(bin) do
-    scan_all(bin, target_field, target_wt, [])
+    if Native.enabled?() do
+      Native.opaque_find_all(bin, target_field, target_wt)
+    else
+      scan_all(bin, target_field, target_wt, [])
+    end
   end
 
   defp scan_all(<<>>, _target_field, _target_wt, acc), do: {:ok, Enum.reverse(acc)}
@@ -91,24 +99,29 @@ defmodule OmniBuf.Opaque do
   @spec splice(binary(), %{optional(non_neg_integer()) => iodata()}) ::
           {:ok, binary()} | {:error, Error.t()}
   def splice(packet, dirty) when is_binary(packet) and is_map(dirty) do
-    if map_size(dirty) == 0 do
-      {:ok, packet}
-    else
-      total = byte_size(packet)
+    cond do
+      map_size(dirty) == 0 ->
+        {:ok, packet}
 
-      case splice_loop(packet, packet, 0, total, dirty, MapSet.new(), []) do
-        {:ok, chunks, emitted} ->
-          trailing_dirty =
-            dirty
-            |> Enum.reject(fn {fnum, _} -> MapSet.member?(emitted, fnum) end)
-            |> Enum.sort_by(fn {fnum, _} -> fnum end)
-            |> Enum.map(fn {_fnum, iodata} -> iodata end)
+      Native.enabled?() ->
+        Native.opaque_splice(packet, dirty)
 
-          {:ok, IO.iodata_to_binary([Enum.reverse(chunks), trailing_dirty])}
+      true ->
+        total = byte_size(packet)
 
-        {:error, _} = err ->
-          err
-      end
+        case splice_loop(packet, packet, 0, total, dirty, MapSet.new(), []) do
+          {:ok, chunks, emitted} ->
+            trailing_dirty =
+              dirty
+              |> Enum.reject(fn {fnum, _} -> MapSet.member?(emitted, fnum) end)
+              |> Enum.sort_by(fn {fnum, _} -> fnum end)
+              |> Enum.map(fn {_fnum, iodata} -> iodata end)
+
+            {:ok, IO.iodata_to_binary([Enum.reverse(chunks), trailing_dirty])}
+
+          {:error, _} = err ->
+            err
+        end
     end
   end
 
@@ -169,30 +182,34 @@ defmodule OmniBuf.Opaque do
   @spec extract_submsg(binary(), non_neg_integer()) ::
           {:ok, binary() | nil} | {:error, Error.t()}
   def extract_submsg(bin, field_num) do
-    case find_all(bin, field_num, 12) do
-      {:ok, []} ->
-        {:ok, nil}
+    if Native.enabled?() do
+      Native.opaque_extract_submsg(bin, field_num)
+    else
+      case find_all(bin, field_num, 12) do
+        {:ok, []} ->
+          {:ok, nil}
 
-      {:ok, [{12, rest}]} ->
-        case Wire.decode_length_prefixed(rest) do
-          {:ok, body, _} -> {:ok, body}
-          err -> err
-        end
-
-      {:ok, many} ->
-        Enum.reduce_while(many, {:ok, []}, fn {12, rest}, {:ok, acc} ->
+        {:ok, [{12, rest}]} ->
           case Wire.decode_length_prefixed(rest) do
-            {:ok, body, _} -> {:cont, {:ok, [acc, body]}}
-            err -> {:halt, err}
+            {:ok, body, _} -> {:ok, body}
+            err -> err
           end
-        end)
-        |> case do
-          {:ok, iodata} -> {:ok, IO.iodata_to_binary(iodata)}
-          err -> err
-        end
 
-      err ->
-        err
+        {:ok, many} ->
+          Enum.reduce_while(many, {:ok, []}, fn {12, rest}, {:ok, acc} ->
+            case Wire.decode_length_prefixed(rest) do
+              {:ok, body, _} -> {:cont, {:ok, [acc, body]}}
+              err -> {:halt, err}
+            end
+          end)
+          |> case do
+            {:ok, iodata} -> {:ok, IO.iodata_to_binary(iodata)}
+            err -> err
+          end
+
+        err ->
+          err
+      end
     end
   end
 end
