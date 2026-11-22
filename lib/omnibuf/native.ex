@@ -9,12 +9,13 @@ defmodule OmniBuf.Native do
   implementation.
   """
 
-  alias OmniBuf.Error
+  alias OmniBuf.{Codec, Error}
   alias OmniBuf.Native.NIF
 
   @loaded_key {__MODULE__, :loaded}
   @enabled_key {__MODULE__, :enabled}
   @schema_key_prefix {__MODULE__, :schema}
+  @dirty_threshold 32_768
 
   @doc """
   Returns `true` if the Rust NIF shared library was successfully loaded.
@@ -82,22 +83,40 @@ defmodule OmniBuf.Native do
   @doc false
   @spec encode_struct(module(), struct()) :: binary()
   def encode_struct(mod, msg) do
-    schema = compiled_schema(mod)
+    {schema, _has_custom_defaults?} = compiled_schema(mod)
     NIF.nif_encode_struct(schema, msg)
   end
 
   @doc false
   @spec decode_struct(module(), binary()) :: {:ok, struct()} | {:error, Error.t()}
   def decode_struct(mod, bin) do
-    schema = compiled_schema(mod)
-    wrap_result(NIF.nif_decode_struct(schema, bin))
+    case compiled_schema(mod) do
+      {_schema, true} ->
+        mod.decode_into(bin, struct(mod), 0)
+
+      {schema, false} ->
+        if byte_size(bin) >= @dirty_threshold do
+          wrap_result(NIF.nif_decode_struct_dirty(schema, bin))
+        else
+          wrap_result(NIF.nif_decode_struct(schema, bin))
+        end
+    end
   end
 
   @doc false
   @spec merge_struct(module(), struct(), binary()) :: {:ok, struct()} | {:error, Error.t()}
   def merge_struct(mod, existing, bin) do
-    schema = compiled_schema(mod)
-    wrap_result(NIF.nif_merge_struct(schema, existing, bin))
+    case compiled_schema(mod) do
+      {_schema, true} ->
+        mod.decode_into(bin, existing, 0)
+
+      {schema, false} ->
+        if byte_size(bin) >= @dirty_threshold do
+          wrap_result(NIF.nif_merge_struct_dirty(schema, existing, bin))
+        else
+          wrap_result(NIF.nif_merge_struct(schema, existing, bin))
+        end
+    end
   end
 
   defp compiled_schema(mod) do
@@ -105,26 +124,38 @@ defmodule OmniBuf.Native do
 
     case :persistent_term.get(key, nil) do
       nil ->
-        ref = NIF.nif_compile_schema(collect_schema_graph(mod))
-        :persistent_term.put(key, ref)
-        ref
+        {graph, has_custom_defaults?} = collect_schema_graph(mod)
+        ref = NIF.nif_compile_schema(graph)
+        entry = {ref, has_custom_defaults?}
+        :persistent_term.put(key, entry)
+        entry
 
-      ref ->
-        ref
+      entry ->
+        entry
     end
   end
 
   defp collect_schema_graph(root_mod) do
     {ordered_mods, index_map} = discover_modules([root_mod], %{root_mod => 0}, [root_mod])
 
-    Enum.map(ordered_mods, fn mod ->
-      fields =
-        Enum.map(mod.__omnibuf_fields__(), fn f ->
-          {f.number, f.name, encode_kind(f.type, index_map), f.emit_empty}
+    has_custom_defaults? =
+      Enum.any?(ordered_mods, fn mod ->
+        Enum.any?(mod.__omnibuf_fields__(), fn f ->
+          f.default !== Codec.default_value(f.type)
         end)
+      end)
 
-      {mod, fields}
-    end)
+    graph =
+      Enum.map(ordered_mods, fn mod ->
+        fields =
+          Enum.map(mod.__omnibuf_fields__(), fn f ->
+            {f.number, f.name, encode_kind(f.type, index_map), f.emit_empty}
+          end)
+
+        {mod, fields}
+      end)
+
+    {graph, has_custom_defaults?}
   end
 
   defp discover_modules([], index_map, acc), do: {Enum.reverse(acc), index_map}
@@ -169,14 +200,24 @@ defmodule OmniBuf.Native do
   @spec decode_blind(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
           {:ok, map()} | {:error, Error.t()}
   def decode_blind(bin, max_depth, max_elements, max_message_bytes) do
-    wrap_result(NIF.nif_decode_blind(bin, max_depth, max_elements, max_message_bytes))
+    if byte_size(bin) >= @dirty_threshold do
+      wrap_result(NIF.nif_decode_blind_dirty(bin, max_depth, max_elements, max_message_bytes))
+    else
+      wrap_result(NIF.nif_decode_blind(bin, max_depth, max_elements, max_message_bytes))
+    end
   end
 
   @doc false
   @spec decode_blind_json(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
           {:ok, String.t()} | {:error, Error.t()}
   def decode_blind_json(bin, max_depth, max_elements, max_message_bytes) do
-    wrap_result(NIF.nif_decode_blind_json(bin, max_depth, max_elements, max_message_bytes))
+    if byte_size(bin) >= @dirty_threshold do
+      wrap_result(
+        NIF.nif_decode_blind_json_dirty(bin, max_depth, max_elements, max_message_bytes)
+      )
+    else
+      wrap_result(NIF.nif_decode_blind_json(bin, max_depth, max_elements, max_message_bytes))
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -209,7 +250,13 @@ defmodule OmniBuf.Native do
   @doc false
   @spec opaque_splice(binary(), map()) :: {:ok, binary()} | {:error, Error.t()}
   def opaque_splice(packet, dirty) do
-    wrap_result(NIF.nif_opaque_splice(packet, Map.to_list(dirty)))
+    dirty_list = Map.to_list(dirty)
+
+    if byte_size(packet) >= @dirty_threshold do
+      wrap_result(NIF.nif_opaque_splice_dirty(packet, dirty_list))
+    else
+      wrap_result(NIF.nif_opaque_splice(packet, dirty_list))
+    end
   end
 
   defp wrap_result({:ok, _} = ok), do: ok

@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use omnibuf::field0::validate_field0;
 use omnibuf::wire::{
-    MAX_NESTING_DEPTH, WIRE_ARRAY, WIRE_BOOL_FALSE, WIRE_BOOL_TRUE, WIRE_BYTES, WIRE_FIXED32,
-    WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32, WIRE_SFIXED64, WIRE_SINT,
-    WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT, append_bytes_elem, append_tag, append_varint,
-    decode_varint, decode_zigzag, encode_zigzag, patch_reserved_varint, read_len_slice,
-    read_str_slice, read_tag_at, validate_value,
+    MAX_FIELD_NUMBER, MAX_NESTING_DEPTH, WIRE_ARRAY, WIRE_BOOL_FALSE, WIRE_BOOL_TRUE, WIRE_BYTES,
+    WIRE_FIXED32, WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32, WIRE_SFIXED64,
+    WIRE_SINT, WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT, append_bytes_elem, append_tag, append_varint,
+    decode_varint, decode_zigzag, encode_zigzag, parse_array_header, parse_map_header,
+    patch_reserved_varint, read_len_slice, read_str_slice, read_tag_at, validate_value,
 };
 use rustler::types::atom::Atom;
 use rustler::types::list::ListIterator;
@@ -15,7 +15,43 @@ use rustler::{Binary, Encoder, Env, NewBinary, NifResult, Term};
 
 use crate::atoms;
 
-const MAX_ELEMENTS: usize = 1_000_000;
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_ELEMENTS: usize = 4_194_304;
+
+pub struct DecodeBudget {
+    pub max_elements: usize,
+    pub elements: usize,
+}
+
+impl DecodeBudget {
+    #[inline]
+    pub fn new(max_elements: usize) -> Self {
+        Self {
+            max_elements,
+            elements: 0,
+        }
+    }
+
+    #[inline]
+    pub fn add_elements(&mut self, count: usize) -> Result<(), DecodeErr> {
+        self.elements = self.elements.checked_add(count).ok_or_else(|| {
+            DecodeErr::new(
+                atoms::element_limit_exceeded(),
+                "cumulative element count overflow",
+            )
+        })?;
+        if self.elements > self.max_elements {
+            return Err(DecodeErr::new(
+                atoms::element_limit_exceeded(),
+                format!(
+                    "cumulative element count {} exceeds limit {}",
+                    self.elements, self.max_elements
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ElemKind {
@@ -62,9 +98,9 @@ impl ElemKind {
 pub struct FieldDesc {
     pub number: u32,
     pub name_atom: Atom,
-    pub tag_bytes: [u8; 5],
+    pub tag_bytes: [u8; 9],
     pub tag_len: u8,
-    pub tag_true_bytes: [u8; 5],
+    pub tag_true_bytes: [u8; 9],
     pub tag_true_len: u8,
     pub emit_empty: bool,
     pub kind: ElemKind,
@@ -141,16 +177,20 @@ pub fn classify_parse_error(msg: &str) -> Atom {
     }
 }
 
-fn encode_tag_arr(field_num: u32, wt: u8) -> ([u8; 5], u8) {
-    let mut tmp = Vec::with_capacity(5);
+fn encode_tag_arr(field_num: u32, wt: u8) -> ([u8; 9], u8) {
+    let mut tmp = Vec::with_capacity(9);
     append_tag(&mut tmp, field_num, wt);
-    let mut arr = [0u8; 5];
-    let len = tmp.len().min(5);
+    let mut arr = [0u8; 9];
+    let len = tmp.len();
     arr[..len].copy_from_slice(&tmp[..len]);
     (arr, len as u8)
 }
 
-fn parse_elem_kind<'a>(term: Term<'a>) -> NifResult<ElemKind> {
+fn parse_elem_kind<'a>(term: Term<'a>, depth: usize) -> NifResult<ElemKind> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(rustler::Error::BadArg);
+    }
+
     if let Ok(a) = term.decode::<Atom>() {
         if a == atoms::uint32() {
             return Ok(ElemKind::Uint32);
@@ -187,7 +227,10 @@ fn parse_elem_kind<'a>(term: Term<'a>) -> NifResult<ElemKind> {
             let idx: usize = inner.decode()?;
             return Ok(ElemKind::Message(idx));
         } else if tag == atoms::array() {
-            let elem = parse_elem_kind(inner)?;
+            if depth + 1 > MAX_NESTING_DEPTH {
+                return Err(rustler::Error::BadArg);
+            }
+            let elem = parse_elem_kind(inner, depth + 1)?;
             return Ok(ElemKind::Array(Box::new(elem)));
         } else if tag == atoms::r#enum() {
             return Ok(ElemKind::Sint32);
@@ -197,14 +240,34 @@ fn parse_elem_kind<'a>(term: Term<'a>) -> NifResult<ElemKind> {
 
     if let Ok((tag, k_term, v_term)) = term.decode::<(Atom, Term<'a>, Term<'a>)>() {
         if tag == atoms::map() {
-            let k = parse_elem_kind(k_term)?;
-            let v = parse_elem_kind(v_term)?;
+            if depth + 1 > MAX_NESTING_DEPTH {
+                return Err(rustler::Error::BadArg);
+            }
+            let k = parse_elem_kind(k_term, depth + 1)?;
+            let v = parse_elem_kind(v_term, depth + 1)?;
             return Ok(ElemKind::Map(Box::new(k), Box::new(v)));
         }
         return Err(rustler::Error::BadArg);
     }
 
     Err(rustler::Error::BadArg)
+}
+
+fn validate_elem_kind(kind: &ElemKind, msg_count: usize) -> NifResult<()> {
+    match kind {
+        ElemKind::Message(idx) => {
+            if *idx >= msg_count {
+                return Err(rustler::Error::BadArg);
+            }
+            Ok(())
+        }
+        ElemKind::Array(inner) => validate_elem_kind(inner, msg_count),
+        ElemKind::Map(k, v) => {
+            validate_elem_kind(k, msg_count)?;
+            validate_elem_kind(v, msg_count)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Compiles a list of message descriptors `[{struct_mod_atom, [{num, name_atom, kind, emit_empty}]}]`
@@ -220,25 +283,42 @@ pub fn compile_schema_from_term<'a>(msg_list: Term<'a>) -> NifResult<CompiledSch
         let mut fields = Vec::new();
         let mut fast_fields = [u16::MAX; 64];
         let mut overflow_fields = HashMap::new();
+        let mut seen_numbers = HashSet::new();
+        let mut seen_names = HashSet::new();
         let mut struct_keys = Vec::new();
         struct_keys.push(atoms::__struct__());
 
         for f_term in field_iter {
+            if fields.len() >= u16::MAX as usize {
+                return Err(rustler::Error::BadArg);
+            }
             let (number, name_atom, kind_term, emit_empty): (u32, Atom, Term<'a>, bool) =
                 f_term.decode()?;
-            let kind = parse_elem_kind(kind_term)?;
+            if number == 0 || u64::from(number) > MAX_FIELD_NUMBER {
+                return Err(rustler::Error::BadArg);
+            }
+            if name_atom == atoms::__struct__() {
+                return Err(rustler::Error::BadArg);
+            }
+            if !seen_numbers.insert(number) {
+                return Err(rustler::Error::BadArg);
+            }
+            if !seen_names.insert(name_atom) {
+                return Err(rustler::Error::BadArg);
+            }
+            let kind = parse_elem_kind(kind_term, 0)?;
             let wt = kind.wire_type();
             let (tag_bytes, tag_len) = encode_tag_arr(number, wt);
             let (tag_true_bytes, tag_true_len) = if matches!(kind, ElemKind::Bool) {
                 encode_tag_arr(number, WIRE_BOOL_TRUE)
             } else {
-                ([0u8; 5], 0)
+                ([0u8; 9], 0)
             };
 
             let idx = fields.len() as u16;
-            if number > 0 && (number as usize) < 64 {
+            if (number as usize) < 64 {
                 fast_fields[number as usize] = idx;
-            } else if number >= 64 {
+            } else {
                 overflow_fields.insert(number, idx);
             }
 
@@ -266,6 +346,13 @@ pub fn compile_schema_from_term<'a>(msg_list: Term<'a>) -> NifResult<CompiledSch
 
     if messages.is_empty() {
         return Err(rustler::Error::BadArg);
+    }
+
+    let msg_count = messages.len();
+    for msg in &messages {
+        for f in &msg.fields {
+            validate_elem_kind(&f.kind, msg_count)?;
+        }
     }
 
     Ok(CompiledSchema { messages })
@@ -305,6 +392,9 @@ fn decode_f32_bits(term: Term<'_>) -> NifResult<u32> {
     if let Ok(i) = term.decode::<i64>() {
         return Ok((i as f32).to_bits());
     }
+    if let Ok(u) = term.decode::<u64>() {
+        return Ok((u as f32).to_bits());
+    }
     if let Ok(a) = term.decode::<Atom>() {
         if a == atoms::infinity() {
             return Ok(0x7F80_0000);
@@ -324,6 +414,9 @@ fn decode_f64_bits(term: Term<'_>) -> NifResult<u64> {
     }
     if let Ok(i) = term.decode::<i64>() {
         return Ok((i as f64).to_bits());
+    }
+    if let Ok(u) = term.decode::<u64>() {
+        return Ok((u as f64).to_bits());
     }
     if let Ok(a) = term.decode::<Atom>() {
         if a == atoms::infinity() {
@@ -347,7 +440,11 @@ pub fn encode_message<'a>(
     msg_idx: usize,
     msg_term: Term<'a>,
     dst: &mut Vec<u8>,
+    depth: usize,
 ) -> NifResult<()> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(rustler::Error::BadArg);
+    }
     let msg_schema = &schema.messages[msg_idx];
 
     for f in &msg_schema.fields {
@@ -440,10 +537,13 @@ pub fn encode_message<'a>(
             }
             ElemKind::Message(sub_idx) => {
                 if !is_nil(val) {
+                    if depth + 1 > MAX_NESTING_DEPTH {
+                        return Err(rustler::Error::BadArg);
+                    }
                     dst.extend_from_slice(tag);
                     let len_pos = dst.len();
                     dst.push(0);
-                    encode_message(schema, *sub_idx, val, dst)?;
+                    encode_message(schema, *sub_idx, val, dst, depth + 1)?;
                     let sub_len = dst.len() - (len_pos + 1);
                     patch_reserved_varint(dst, len_pos, sub_len as u64);
                 }
@@ -451,15 +551,21 @@ pub fn encode_message<'a>(
             ElemKind::Array(elem_kind) => {
                 let list_len = val.list_length()?;
                 if list_len > 0 || f.emit_empty {
+                    if depth + 1 > MAX_NESTING_DEPTH {
+                        return Err(rustler::Error::BadArg);
+                    }
                     dst.extend_from_slice(tag);
-                    encode_array_body(schema, elem_kind, val, list_len, dst)?;
+                    encode_array_body(schema, elem_kind, val, list_len, dst, depth + 1)?;
                 }
             }
             ElemKind::Map(k_kind, v_kind) => {
                 let map_len = val.map_size()?;
                 if map_len > 0 || f.emit_empty {
+                    if depth + 1 > MAX_NESTING_DEPTH {
+                        return Err(rustler::Error::BadArg);
+                    }
                     dst.extend_from_slice(tag);
-                    encode_map_body(schema, k_kind, v_kind, val, map_len, dst)?;
+                    encode_map_body(schema, k_kind, v_kind, val, map_len, dst, depth + 1)?;
                 }
             }
         }
@@ -474,6 +580,7 @@ fn encode_array_body<'a>(
     list_term: Term<'a>,
     list_len: usize,
     dst: &mut Vec<u8>,
+    depth: usize,
 ) -> NifResult<()> {
     let len_pos = dst.len();
     dst.push(0);
@@ -482,7 +589,7 @@ fn encode_array_body<'a>(
 
     let iter: ListIterator<'a> = list_term.decode()?;
     for item in iter {
-        encode_element(schema, elem_kind, item, dst)?;
+        encode_element(schema, elem_kind, item, dst, depth)?;
     }
 
     let body_len = dst.len() - (len_pos + 1);
@@ -497,6 +604,7 @@ fn encode_map_body<'a>(
     map_term: Term<'a>,
     map_len: usize,
     dst: &mut Vec<u8>,
+    depth: usize,
 ) -> NifResult<()> {
     let len_pos = dst.len();
     dst.push(0);
@@ -515,10 +623,25 @@ fn encode_map_body<'a>(
                 pairs.sort_unstable_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
                 for (k, v) in pairs {
                     append_bytes_elem(dst, k.as_slice());
-                    encode_element(schema, v_kind, v, dst)?;
+                    encode_element(schema, v_kind, v, dst, depth)?;
                 }
             }
-            ElemKind::Uint32 | ElemKind::Uint64 | ElemKind::Fixed32 | ElemKind::Fixed64 => {
+            ElemKind::Uint32 | ElemKind::Fixed32 => {
+                let mut pairs: Vec<(u32, Term<'a>)> = Vec::with_capacity(map_len);
+                for (k, v) in iter {
+                    pairs.push((decode_u64_narrow(k)? as u32, v));
+                }
+                pairs.sort_unstable_by_key(|p| p.0);
+                for (k, v) in pairs {
+                    match k_kind {
+                        ElemKind::Uint32 => append_varint(dst, u64::from(k)),
+                        ElemKind::Fixed32 => dst.extend_from_slice(&k.to_le_bytes()),
+                        _ => unreachable!(),
+                    }
+                    encode_element(schema, v_kind, v, dst, depth)?;
+                }
+            }
+            ElemKind::Uint64 | ElemKind::Fixed64 => {
                 let mut pairs: Vec<(u64, Term<'a>)> = Vec::with_capacity(map_len);
                 for (k, v) in iter {
                     pairs.push((decode_u64_narrow(k)?, v));
@@ -526,16 +649,29 @@ fn encode_map_body<'a>(
                 pairs.sort_unstable_by_key(|p| p.0);
                 for (k, v) in pairs {
                     match k_kind {
-                        ElemKind::Uint32 => append_varint(dst, u64::from(k as u32)),
                         ElemKind::Uint64 => append_varint(dst, k),
-                        ElemKind::Fixed32 => dst.extend_from_slice(&(k as u32).to_le_bytes()),
                         ElemKind::Fixed64 => dst.extend_from_slice(&k.to_le_bytes()),
                         _ => unreachable!(),
                     }
-                    encode_element(schema, v_kind, v, dst)?;
+                    encode_element(schema, v_kind, v, dst, depth)?;
                 }
             }
-            ElemKind::Sint32 | ElemKind::Sint64 | ElemKind::Sfixed32 | ElemKind::Sfixed64 => {
+            ElemKind::Sint32 | ElemKind::Sfixed32 => {
+                let mut pairs: Vec<(i32, Term<'a>)> = Vec::with_capacity(map_len);
+                for (k, v) in iter {
+                    pairs.push((decode_i64_narrow(k)? as i32, v));
+                }
+                pairs.sort_unstable_by_key(|p| p.0);
+                for (k, v) in pairs {
+                    match k_kind {
+                        ElemKind::Sint32 => append_varint(dst, encode_zigzag(i64::from(k))),
+                        ElemKind::Sfixed32 => dst.extend_from_slice(&k.to_le_bytes()),
+                        _ => unreachable!(),
+                    }
+                    encode_element(schema, v_kind, v, dst, depth)?;
+                }
+            }
+            ElemKind::Sint64 | ElemKind::Sfixed64 => {
                 let mut pairs: Vec<(i64, Term<'a>)> = Vec::with_capacity(map_len);
                 for (k, v) in iter {
                     pairs.push((decode_i64_narrow(k)?, v));
@@ -543,13 +679,11 @@ fn encode_map_body<'a>(
                 pairs.sort_unstable_by_key(|p| p.0);
                 for (k, v) in pairs {
                     match k_kind {
-                        ElemKind::Sint32 => append_varint(dst, encode_zigzag(i64::from(k as i32))),
                         ElemKind::Sint64 => append_varint(dst, encode_zigzag(k)),
-                        ElemKind::Sfixed32 => dst.extend_from_slice(&(k as i32).to_le_bytes()),
                         ElemKind::Sfixed64 => dst.extend_from_slice(&k.to_le_bytes()),
                         _ => unreachable!(),
                     }
-                    encode_element(schema, v_kind, v, dst)?;
+                    encode_element(schema, v_kind, v, dst, depth)?;
                 }
             }
             ElemKind::Bool => {
@@ -560,7 +694,7 @@ fn encode_map_body<'a>(
                 pairs.sort_unstable_by_key(|p| p.0);
                 for (k, v) in pairs {
                     dst.push(if k { 1 } else { 0 });
-                    encode_element(schema, v_kind, v, dst)?;
+                    encode_element(schema, v_kind, v, dst, depth)?;
                 }
             }
             _ => return Err(rustler::Error::BadArg),
@@ -577,6 +711,7 @@ fn encode_element<'a>(
     kind: &ElemKind,
     val: Term<'a>,
     dst: &mut Vec<u8>,
+    depth: usize,
 ) -> NifResult<()> {
     match kind {
         ElemKind::Uint32 => {
@@ -628,20 +763,29 @@ fn encode_element<'a>(
             if is_nil(val) {
                 dst.push(0x01);
             } else {
+                if depth + 1 > MAX_NESTING_DEPTH {
+                    return Err(rustler::Error::BadArg);
+                }
                 let len_pos = dst.len();
                 dst.push(0);
-                encode_message(schema, *sub_idx, val, dst)?;
+                encode_message(schema, *sub_idx, val, dst, depth + 1)?;
                 let sub_len = dst.len() - (len_pos + 1);
                 patch_reserved_varint(dst, len_pos, sub_len as u64);
             }
         }
         ElemKind::Array(inner) => {
+            if depth + 1 > MAX_NESTING_DEPTH {
+                return Err(rustler::Error::BadArg);
+            }
             let list_len = val.list_length()?;
-            encode_array_body(schema, inner, val, list_len, dst)?;
+            encode_array_body(schema, inner, val, list_len, dst, depth + 1)?;
         }
         ElemKind::Map(k_kind, v_kind) => {
+            if depth + 1 > MAX_NESTING_DEPTH {
+                return Err(rustler::Error::BadArg);
+            }
             let map_len = val.map_size()?;
-            encode_map_body(schema, k_kind, v_kind, val, map_len, dst)?;
+            encode_map_body(schema, k_kind, v_kind, val, map_len, dst, depth + 1)?;
         }
     }
     Ok(())
@@ -713,7 +857,19 @@ pub fn decode_message<'a>(
     raw: &[u8],
     existing: Option<Term<'a>>,
     depth: usize,
+    budget: &mut DecodeBudget,
 ) -> Result<Term<'a>, DecodeErr> {
+    if depth == 0 && raw.len() > DEFAULT_MAX_MESSAGE_BYTES {
+        return Err(DecodeErr::new(
+            atoms::message_too_large(),
+            format!(
+                "packet size {} exceeds {}",
+                raw.len(),
+                DEFAULT_MAX_MESSAGE_BYTES
+            ),
+        ));
+    }
+
     let msg_schema = &schema.messages[msg_idx];
     let n_fields = msg_schema.fields.len();
 
@@ -732,6 +888,8 @@ pub fn decode_message<'a>(
             vals.push(default_term(env, &f.kind));
         }
     }
+
+    let mut array_acc: Option<Vec<Option<Vec<Term<'a>>>>> = None;
 
     let len = raw.len();
     let mut pos = 0usize;
@@ -881,33 +1039,66 @@ pub fn decode_message<'a>(
                 } else {
                     Some(vals[val_slot])
                 };
-                vals[val_slot] =
-                    decode_message(env, schema, *sub_idx, body, existing_sub, depth + 1)?;
+                vals[val_slot] = decode_message(
+                    env,
+                    schema,
+                    *sub_idx,
+                    body,
+                    existing_sub,
+                    depth + 1,
+                    budget,
+                )?;
             }
             (ElemKind::Array(elem_kind), WIRE_ARRAY) => {
-                let (items, next_pos) = decode_array(env, schema, elem_kind, raw, pos, depth)?;
+                let (items, next_pos) =
+                    decode_array(env, schema, elem_kind, raw, pos, depth, budget)?;
                 pos = next_pos;
-                let existing_list = vals[val_slot];
-                if existing_list.list_length().unwrap_or(0) == 0 {
-                    vals[val_slot] = items.encode(env);
-                } else {
-                    let mut combined: Vec<Term<'a>> = existing_list
-                        .decode::<ListIterator<'a>>()
-                        .map(|it| it.collect())
-                        .unwrap_or_default();
-                    combined.extend(items);
-                    vals[val_slot] = combined.encode(env);
+                let accs = array_acc.get_or_insert_with(|| vec![None; n_fields]);
+                match &mut accs[fi] {
+                    Some(vec) => {
+                        vec.extend(items);
+                    }
+                    slot @ None => {
+                        let existing_list = vals[val_slot];
+                        if existing_list.list_length().unwrap_or(0) == 0 {
+                            *slot = Some(items);
+                        } else {
+                            let mut combined: Vec<Term<'a>> = existing_list
+                                .decode::<ListIterator<'a>>()
+                                .map(|it| it.collect())
+                                .unwrap_or_default();
+                            combined.extend(items);
+                            *slot = Some(combined);
+                        }
+                    }
                 }
             }
             (ElemKind::Map(k_kind, v_kind), WIRE_MAP) => {
-                let (merged_map, next_pos) =
-                    decode_map(env, schema, k_kind, v_kind, raw, pos, vals[val_slot], depth)?;
+                let (merged_map, next_pos) = decode_map(
+                    env,
+                    schema,
+                    k_kind,
+                    v_kind,
+                    raw,
+                    pos,
+                    vals[val_slot],
+                    depth,
+                    budget,
+                )?;
                 pos = next_pos;
                 vals[val_slot] = merged_map;
             }
             // Wire type mismatch on known field: skip with validation
             _ => {
                 pos = validate_value(raw, pos, wt, depth).map_err(DecodeErr::from_omnibuf)?;
+            }
+        }
+    }
+
+    if let Some(accs) = array_acc {
+        for (fi, maybe_vec) in accs.into_iter().enumerate() {
+            if let Some(vec) = maybe_vec {
+                vals[fi + 1] = vec.encode(env);
             }
         }
     }
@@ -924,6 +1115,7 @@ fn decode_array<'a>(
     raw: &[u8],
     pos: usize,
     depth: usize,
+    budget: &mut DecodeBudget,
 ) -> Result<(Vec<Term<'a>>, usize), DecodeErr> {
     if depth + 1 > MAX_NESTING_DEPTH {
         return Err(DecodeErr::new(
@@ -945,12 +1137,18 @@ fn decode_array<'a>(
             "invalid WireArray count varint",
         ));
     };
-    let count = count_u64 as usize;
-    let hdr_len = 1 + vn;
-    if count > MAX_ELEMENTS {
-        return Err(DecodeErr::new(
+    let count = usize::try_from(count_u64).map_err(|_| {
+        DecodeErr::new(
             atoms::element_limit_exceeded(),
-            format!("array element count {count} exceeds limit {MAX_ELEMENTS}"),
+            format!("array element count {count_u64} overflows usize"),
+        )
+    })?;
+    let hdr_len = 1 + vn;
+    let remaining = body.len() - hdr_len;
+    if count == 0 && remaining != 0 {
+        return Err(DecodeErr::new(
+            atoms::trailing_bytes(),
+            "empty WireArray has trailing bytes",
         ));
     }
     let expected_wt = elem_kind.wire_type();
@@ -960,11 +1158,21 @@ fn decode_array<'a>(
             format!("WireArray ElementType mismatch: expected {expected_wt}, got {actual_wt}"),
         ));
     }
+    let Some((_, parsed_count, parsed_hdr_len)) = parse_array_header(body) else {
+        return Err(DecodeErr::new(
+            atoms::parse_error(),
+            "invalid WireArray header or count exceeds remaining bytes",
+        ));
+    };
+    debug_assert_eq!(count, parsed_count);
+    debug_assert_eq!(hdr_len, parsed_hdr_len);
+
+    budget.add_elements(count)?;
 
     let mut cur = hdr_len;
     let mut items = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
-        let (val, next) = decode_element(env, schema, elem_kind, body, cur, depth + 1)?;
+        let (val, next) = decode_element(env, schema, elem_kind, body, cur, depth + 1, budget)?;
         items.push(val);
         cur = next;
     }
@@ -987,6 +1195,7 @@ fn decode_map<'a>(
     pos: usize,
     mut acc: Term<'a>,
     depth: usize,
+    budget: &mut DecodeBudget,
 ) -> Result<(Term<'a>, usize), DecodeErr> {
     if depth + 1 > MAX_NESTING_DEPTH {
         return Err(DecodeErr::new(
@@ -1020,12 +1229,18 @@ fn decode_map<'a>(
             "invalid WireMap count varint",
         ));
     };
-    let count = count_u64 as usize;
-    let hdr_len = 2 + vn;
-    if count > MAX_ELEMENTS {
-        return Err(DecodeErr::new(
+    let count = usize::try_from(count_u64).map_err(|_| {
+        DecodeErr::new(
             atoms::element_limit_exceeded(),
-            format!("map entry count {count} exceeds limit {MAX_ELEMENTS}"),
+            format!("map entry count {count_u64} overflows usize"),
+        )
+    })?;
+    let hdr_len = 2 + vn;
+    let remaining = body.len() - hdr_len;
+    if count == 0 && remaining != 0 {
+        return Err(DecodeErr::new(
+            atoms::trailing_bytes(),
+            "empty WireMap has trailing bytes",
         ));
     }
     let expected_kt = k_kind.wire_type();
@@ -1038,11 +1253,21 @@ fn decode_map<'a>(
             ),
         ));
     }
+    let Some((_, _, parsed_count, parsed_hdr_len)) = parse_map_header(body) else {
+        return Err(DecodeErr::new(
+            atoms::parse_error(),
+            "invalid WireMap header or count exceeds remaining bytes",
+        ));
+    };
+    debug_assert_eq!(count, parsed_count);
+    debug_assert_eq!(hdr_len, parsed_hdr_len);
+
+    budget.add_elements(count)?;
 
     let mut cur = hdr_len;
     for _ in 0..count {
-        let (k, after_k) = decode_element(env, schema, k_kind, body, cur, depth + 1)?;
-        let (v, after_v) = decode_element(env, schema, v_kind, body, after_k, depth + 1)?;
+        let (k, after_k) = decode_element(env, schema, k_kind, body, cur, depth + 1, budget)?;
+        let (v, after_v) = decode_element(env, schema, v_kind, body, after_k, depth + 1, budget)?;
         acc = acc
             .map_put(k, v)
             .map_err(|_| DecodeErr::new(atoms::parse_error(), "failed to insert map entry"))?;
@@ -1064,6 +1289,7 @@ fn decode_element<'a>(
     raw: &[u8],
     pos: usize,
     depth: usize,
+    budget: &mut DecodeBudget,
 ) -> Result<(Term<'a>, usize), DecodeErr> {
     match kind {
         ElemKind::Uint32 => {
@@ -1157,17 +1383,17 @@ fn decode_element<'a>(
                 ));
             }
             let (body, next_pos) = read_len_slice(raw, pos, 0).map_err(DecodeErr::from_omnibuf)?;
-            let sub = decode_message(env, schema, *sub_idx, body, None, depth + 1)?;
+            let sub = decode_message(env, schema, *sub_idx, body, None, depth + 1, budget)?;
             Ok((sub, next_pos))
         }
         ElemKind::Array(inner) => {
-            let (items, next_pos) = decode_array(env, schema, inner, raw, pos, depth)?;
+            let (items, next_pos) = decode_array(env, schema, inner, raw, pos, depth, budget)?;
             Ok((items.encode(env), next_pos))
         }
         ElemKind::Map(k_kind, v_kind) => {
             let empty_map = Term::map_new(env);
             let (m, next_pos) =
-                decode_map(env, schema, k_kind, v_kind, raw, pos, empty_map, depth)?;
+                decode_map(env, schema, k_kind, v_kind, raw, pos, empty_map, depth, budget)?;
             Ok((m, next_pos))
         }
     }

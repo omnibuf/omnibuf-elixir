@@ -67,7 +67,13 @@ defmodule OmniBuf.Native.NIF do
   def nif_decode_blind(_bin, _max_depth, _max_elements, _max_message_bytes),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def nif_decode_blind_dirty(_bin, _max_depth, _max_elements, _max_message_bytes),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def nif_decode_blind_json(_bin, _max_depth, _max_elements, _max_message_bytes),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_decode_blind_json_dirty(_bin, _max_depth, _max_elements, _max_message_bytes),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def nif_opaque_find_last(_bin, _target_field, _target_wt),
@@ -82,6 +88,9 @@ defmodule OmniBuf.Native.NIF do
   def nif_opaque_splice(_packet, _dirty_list),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def nif_opaque_splice_dirty(_packet, _dirty_list),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def nif_compile_schema(_msg_list),
     do: :erlang.nif_error(:nif_not_loaded)
 
@@ -91,6 +100,12 @@ defmodule OmniBuf.Native.NIF do
   def nif_decode_struct(_schema, _bin),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def nif_decode_struct_dirty(_schema, _bin),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def nif_merge_struct(_schema, _existing, _bin),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_merge_struct_dirty(_schema, _existing, _bin),
     do: :erlang.nif_error(:nif_not_loaded)
 end

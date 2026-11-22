@@ -28,7 +28,7 @@ defmodule OmniBuf.Wire do
 
   @max_field_number 536_870_911
   @max_depth 32
-  @default_max_elements 1_000_000
+  @default_max_elements 4_194_304
   @uint64_mask 0xFFFF_FFFF_FFFF_FFFF
   @uint32_mask 0xFFFF_FFFF
 
@@ -485,8 +485,22 @@ defmodule OmniBuf.Wire do
     end
   end
 
+  def skip_fast(@wire_array, bin) do
+    case decode_array_header(bin, byte_size(bin)) do
+      {:ok, _elem_type, _count, _elem_bytes, rest} -> {:ok, rest}
+      {:error, _} = err -> err
+    end
+  end
+
+  def skip_fast(@wire_map, bin) do
+    case decode_map_header(bin, byte_size(bin)) do
+      {:ok, _kt, _vt, _count, _entry_bytes, rest} -> {:ok, rest}
+      {:error, _} = err -> err
+    end
+  end
+
   def skip_fast(wt, bin)
-      when wt in [@wire_string, @wire_bytes, @wire_sub_msg, @wire_array, @wire_map] do
+      when wt in [@wire_string, @wire_bytes, @wire_sub_msg] do
     case decode_length_prefixed(bin) do
       {:ok, _slice, rest} -> {:ok, rest}
       err -> err
@@ -500,84 +514,137 @@ defmodule OmniBuf.Wire do
   @doc """
   Skips a wire value while validating container bounds, nesting depth (max 32),
   and Field #0 wire type invariants inside unknown submessages.
-  Unread `WireString` payloads are skipped in O(1) by `ByteLen`.
   """
   @spec skip_validated(0..15, binary(), non_neg_integer()) ::
           {:ok, binary()} | {:error, Error.t()}
-  def skip_validated(@wire_sub_msg, bin, depth) do
-    if depth + 1 > @max_depth do
-      Error.parse(:max_depth_exceeded, "max container depth #{@max_depth} exceeded")
-    else
-      with {:ok, body, rest} <- decode_length_prefixed(bin),
-           :ok <- validate_message_stream(body, depth + 1) do
-        {:ok, rest}
-      end
-    end
-  end
+  def skip_validated(wt, bin, depth) do
+    budget = %{max_depth: @max_depth, max_elements: @default_max_elements, elements: 0}
 
-  def skip_validated(@wire_array, bin, depth) do
-    if depth + 1 > @max_depth do
-      Error.parse(:max_depth_exceeded, "max container depth #{@max_depth} exceeded")
-    else
-      with {:ok, elem_type, count, elem_bytes, rest} <- decode_array_header(bin),
-           :ok <- validate_array_elements(elem_type, count, elem_bytes, depth + 1) do
-        {:ok, rest}
-      end
-    end
-  end
-
-  def skip_validated(@wire_map, bin, depth) do
-    if depth + 1 > @max_depth do
-      Error.parse(:max_depth_exceeded, "max container depth #{@max_depth} exceeded")
-    else
-      with {:ok, key_type, val_type, count, entry_bytes, rest} <- decode_map_header(bin),
-           :ok <- validate_map_entries(key_type, val_type, count, entry_bytes, depth + 1) do
-        {:ok, rest}
-      end
-    end
-  end
-
-  def skip_validated(@wire_string, bin, _depth) do
-    case decode_string(bin) do
-      {:ok, _str, rest} -> {:ok, rest}
+    case skip_validated_with_budget(wt, bin, depth, budget) do
+      {:ok, rest, _budget} -> {:ok, rest}
       {:error, _} = err -> err
     end
   end
 
-  def skip_validated(wt, bin, _depth), do: skip_fast(wt, bin)
+  @doc false
+  @spec skip_validated_with_budget(0..15, binary(), non_neg_integer(), map()) ::
+          {:ok, binary(), map()} | {:error, Error.t()}
+  def skip_validated_with_budget(@wire_sub_msg, bin, depth, %{max_depth: max_depth} = budget) do
+    if depth + 1 > max_depth do
+      Error.parse(:max_depth_exceeded, "max container depth #{max_depth} exceeded")
+    else
+      with {:ok, body, rest} <- decode_length_prefixed(bin),
+           {:ok, new_budget} <- validate_message_stream_with_budget(body, depth + 1, budget) do
+        {:ok, rest, new_budget}
+      end
+    end
+  end
+
+  def skip_validated_with_budget(@wire_array, bin, depth, %{max_depth: max_depth} = budget) do
+    if depth + 1 > max_depth do
+      Error.parse(:max_depth_exceeded, "max container depth #{max_depth} exceeded")
+    else
+      with {:ok, elem_type, count, elem_bytes, rest} <-
+             decode_array_header(bin, budget.max_elements),
+           {:ok, budget} <- add_budget_elements(budget, count),
+           {:ok, new_budget} <-
+             validate_array_elements(elem_type, count, elem_bytes, depth + 1, budget) do
+        {:ok, rest, new_budget}
+      end
+    end
+  end
+
+  def skip_validated_with_budget(@wire_map, bin, depth, %{max_depth: max_depth} = budget) do
+    if depth + 1 > max_depth do
+      Error.parse(:max_depth_exceeded, "max container depth #{max_depth} exceeded")
+    else
+      with {:ok, key_type, val_type, count, entry_bytes, rest} <-
+             decode_map_header(bin, budget.max_elements),
+           {:ok, budget} <- add_budget_elements(budget, count),
+           {:ok, new_budget} <-
+             validate_map_entries(key_type, val_type, count, entry_bytes, depth + 1, budget) do
+        {:ok, rest, new_budget}
+      end
+    end
+  end
+
+  def skip_validated_with_budget(@wire_string, bin, _depth, budget) do
+    case decode_string(bin) do
+      {:ok, _str, rest} -> {:ok, rest, budget}
+      {:error, _} = err -> err
+    end
+  end
+
+  def skip_validated_with_budget(wt, bin, _depth, budget) do
+    case skip_fast(wt, bin) do
+      {:ok, rest} -> {:ok, rest, budget}
+      {:error, _} = err -> err
+    end
+  end
 
   @doc """
   Validates an entire message field stream (for unknown submessages).
   """
   @spec validate_message_stream(binary(), non_neg_integer()) :: :ok | {:error, Error.t()}
-  def validate_message_stream(<<>>, _depth), do: :ok
-
   def validate_message_stream(bin, depth) do
+    budget = %{max_depth: @max_depth, max_elements: @default_max_elements, elements: 0}
+
+    case validate_message_stream_with_budget(bin, depth, budget) do
+      {:ok, _budget} -> :ok
+      {:error, _} = err -> err
+    end
+  end
+
+  @doc false
+  @spec validate_message_stream_with_budget(binary(), non_neg_integer(), map()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def validate_message_stream_with_budget(<<>>, _depth, budget), do: {:ok, budget}
+
+  def validate_message_stream_with_budget(bin, depth, budget) do
     with {:ok, field_num, wt, rest} <- decode_tag(bin) do
       if field_num == 0 do
-        case OmniBuf.SchemaMeta.decode_field(rest, depth) do
-          {:ok, _meta, tail} -> validate_message_stream(tail, depth)
-          {:error, _} = err -> err
+        case OmniBuf.SchemaMeta.decode_field(rest, depth, budget) do
+          {:ok, _meta, tail, new_budget} ->
+            validate_message_stream_with_budget(tail, depth, new_budget)
+
+          {:error, _} = err ->
+            err
         end
       else
-        case skip_validated(wt, rest, depth) do
-          {:ok, tail} -> validate_message_stream(tail, depth)
-          {:error, _} = err -> err
+        case skip_validated_with_budget(wt, rest, depth, budget) do
+          {:ok, tail, new_budget} ->
+            validate_message_stream_with_budget(tail, depth, new_budget)
+
+          {:error, _} = err ->
+            err
         end
       end
     end
   end
 
-  defp validate_array_elements(_elem_type, 0, <<>>, _depth), do: :ok
+  defp add_budget_elements(%{elements: el, max_elements: max} = budget, count) do
+    next = el + count
 
-  defp validate_array_elements(_elem_type, 0, _trailing, _depth),
-    do: Error.parse(:trailing_bytes, "trailing bytes in WireArray")
-
-  defp validate_array_elements(@wire_bool_false, count, bin, _depth) do
-    validate_bool_bytes(bin, count)
+    if next > max do
+      Error.parse(:element_limit_exceeded, "cumulative element count #{next} exceeds #{max}")
+    else
+      {:ok, %{budget | elements: next}}
+    end
   end
 
-  defp validate_array_elements(elem_type, _count, _bin, _depth)
+  defp validate_array_elements(_elem_type, 0, <<>>, _depth, budget), do: {:ok, budget}
+
+  defp validate_array_elements(_elem_type, 0, _trailing, _depth, _budget),
+    do: Error.parse(:trailing_bytes, "trailing bytes in WireArray")
+
+  defp validate_array_elements(@wire_bool_false, count, bin, _depth, budget) do
+    case validate_bool_bytes(bin, count) do
+      :ok -> {:ok, budget}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp validate_array_elements(elem_type, _count, _bin, _depth, budget)
        when elem_type in [
               @wire_fixed32,
               @wire_fixed64,
@@ -587,38 +654,43 @@ defmodule OmniBuf.Wire do
               @wire_float64
             ] do
     # Exact byte length was already verified in decode_array_header.
-    :ok
+    {:ok, budget}
   end
 
-  defp validate_array_elements(elem_type, count, bin, depth) do
-    case skip_collection_value(elem_type, bin, depth) do
-      {:ok, rest} -> validate_array_elements(elem_type, count - 1, rest, depth)
-      {:error, _} = err -> err
+  defp validate_array_elements(elem_type, count, bin, depth, budget) do
+    case skip_collection_value(elem_type, bin, depth, budget) do
+      {:ok, rest, new_budget} ->
+        validate_array_elements(elem_type, count - 1, rest, depth, new_budget)
+
+      {:error, _} = err ->
+        err
     end
   end
 
-  defp validate_map_entries(_kt, _vt, 0, <<>>, _depth), do: :ok
+  defp validate_map_entries(_kt, _vt, 0, <<>>, _depth, budget), do: {:ok, budget}
 
-  defp validate_map_entries(_kt, _vt, 0, _trailing, _depth),
+  defp validate_map_entries(_kt, _vt, 0, _trailing, _depth, _budget),
     do: Error.parse(:trailing_bytes, "trailing bytes in WireMap")
 
-  defp validate_map_entries(kt, vt, count, bin, depth) do
-    with {:ok, after_key} <- skip_collection_value(kt, bin, depth),
-         {:ok, after_val} <- skip_collection_value(vt, after_key, depth) do
-      validate_map_entries(kt, vt, count - 1, after_val, depth)
+  defp validate_map_entries(kt, vt, count, bin, depth, budget) do
+    with {:ok, after_key, budget} <- skip_collection_value(kt, bin, depth, budget),
+         {:ok, after_val, budget} <- skip_collection_value(vt, after_key, depth, budget) do
+      validate_map_entries(kt, vt, count - 1, after_val, depth, budget)
     end
   end
 
-  defp skip_collection_value(@wire_bool_false, <<b, rest::binary>>, _depth) when b in [0, 1],
-    do: {:ok, rest}
+  defp skip_collection_value(@wire_bool_false, <<b, rest::binary>>, _depth, budget)
+       when b in [0, 1],
+       do: {:ok, rest, budget}
 
-  defp skip_collection_value(@wire_bool_false, <<b, _::binary>>, _depth),
+  defp skip_collection_value(@wire_bool_false, <<b, _::binary>>, _depth, _budget),
     do: Error.parse(:invalid_bool_byte, "invalid boolean byte #{b} in collection")
 
-  defp skip_collection_value(@wire_bool_false, <<>>, _depth),
+  defp skip_collection_value(@wire_bool_false, <<>>, _depth, _budget),
     do: Error.parse(:truncated_bool, "truncated boolean in collection")
 
-  defp skip_collection_value(wt, bin, depth), do: skip_validated(wt, bin, depth)
+  defp skip_collection_value(wt, bin, depth, budget),
+    do: skip_validated_with_budget(wt, bin, depth, budget)
 
   defp validate_bool_bytes(<<>>, 0), do: :ok
 

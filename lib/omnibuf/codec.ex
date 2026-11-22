@@ -158,8 +158,15 @@ defmodule OmniBuf.Codec do
     Wire.encode_length_prefixed([<<kt, vt>>, Wire.encode_varint(length(sorted)), entries])
   end
 
-  # In Erlang/Elixir, binary `<` compares in unsigned byte order, integer `<` compares
-  # numerically, and `false < true` is true!
+  # Narrow 32-bit integer keys before sorting so map ordering matches wire values.
+  defp sort_map_entries(entries, key_type) when key_type in [:uint32, :fixed32] do
+    Enum.sort_by(entries, fn {k, _v} -> Wire.narrow_uint32(k) end)
+  end
+
+  defp sort_map_entries(entries, key_type) when key_type in [:int32, :sint32, :sfixed32] do
+    Enum.sort_by(entries, fn {k, _v} -> Wire.narrow_int32(k) end)
+  end
+
   defp sort_map_entries(entries, _key_type) do
     Enum.sort_by(entries, fn {k, _v} -> k end)
   end

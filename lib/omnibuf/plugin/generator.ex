@@ -154,10 +154,15 @@ defmodule OmniBuf.Plugin.Generator do
     }
   end
 
+  @elixir_reserved_keywords MapSet.new(~w(
+    end do fn true false nil and or not in after else catch rescue when
+  ))
+
   defp gen_enum(enum_desc, mod_name) do
     entries =
       Enum.map_join(enum_desc.value, "\n", fn v ->
-        "  def #{String.downcase(v.name)}, do: #{v.number}"
+        fn_name = escape_enum_fn_name(v.name)
+        "  def #{fn_name}, do: #{v.number}"
       end)
 
     """
@@ -166,6 +171,16 @@ defmodule OmniBuf.Plugin.Generator do
     #{entries}
     end
     """
+  end
+
+  defp escape_enum_fn_name(name) do
+    down = String.downcase(name)
+
+    if MapSet.member?(@elixir_reserved_keywords, down) do
+      "#{down}_"
+    else
+      down
+    end
   end
 
   defp gen_message(%DescriptorProto{options: %{map_entry: true}}, _pkg, _mod, _tm, _me), do: []
@@ -600,6 +615,14 @@ defmodule OmniBuf.Plugin.Generator do
   defp scalar_atom(:TYPE_DOUBLE), do: :double
   defp scalar_atom(:TYPE_STRING), do: :string
   defp scalar_atom(:TYPE_BYTES), do: :bytes
+
+  defp scalar_atom(:TYPE_GROUP) do
+    raise ArgumentError, "proto2 groups (TYPE_GROUP) are not supported by OmniBuf"
+  end
+
+  defp scalar_atom(other) do
+    raise ArgumentError, "unsupported Protobuf field type: #{inspect(other)}"
+  end
 
   defp package_to_module("", ""), do: ""
   defp package_to_module("", prefix), do: prefix

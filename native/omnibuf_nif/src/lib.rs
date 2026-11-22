@@ -17,7 +17,9 @@ use omnibuf::wire::{
 use rustler::types::list::ListIterator;
 use rustler::{Binary, Encoder, Env, NewBinary, NifResult, ResourceArc, Term};
 
-use crate::schema::{CompiledSchema, DecodeErr, compile_schema_from_term};
+use crate::schema::{
+    CompiledSchema, DEFAULT_MAX_ELEMENTS, DecodeBudget, DecodeErr, compile_schema_from_term,
+};
 
 pub mod atoms {
     rustler::atoms! {
@@ -147,8 +149,14 @@ fn blind_map_to_term<'a>(env: Env<'a>, map: &BTreeMap<String, BlindValue>) -> Te
 // Tier 4: Blind Decoding NIFs
 // ---------------------------------------------------------------------------
 
-#[rustler::nif]
-fn nif_decode_blind<'a>(
+#[inline]
+fn blind_alloc_limit(max_message_bytes: usize) -> usize {
+    max_message_bytes
+        .saturating_mul(64)
+        .min(max_message_bytes.max(64 * 1024 * 1024))
+}
+
+fn decode_blind_impl<'a>(
     env: Env<'a>,
     bin: Binary<'a>,
     max_depth: usize,
@@ -170,7 +178,7 @@ fn nif_decode_blind<'a>(
         inherited_schema: None,
         max_message_bytes,
         max_elements,
-        max_alloc_bytes: max_message_bytes.max(64 * 1024 * 1024),
+        max_alloc_bytes: blind_alloc_limit(max_message_bytes),
         max_depth: max_depth.min(MAX_NESTING_DEPTH),
     };
 
@@ -181,7 +189,28 @@ fn nif_decode_blind<'a>(
 }
 
 #[rustler::nif]
-fn nif_decode_blind_json<'a>(
+fn nif_decode_blind<'a>(
+    env: Env<'a>,
+    bin: Binary<'a>,
+    max_depth: usize,
+    max_elements: usize,
+    max_message_bytes: usize,
+) -> Term<'a> {
+    decode_blind_impl(env, bin, max_depth, max_elements, max_message_bytes)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn nif_decode_blind_dirty<'a>(
+    env: Env<'a>,
+    bin: Binary<'a>,
+    max_depth: usize,
+    max_elements: usize,
+    max_message_bytes: usize,
+) -> Term<'a> {
+    decode_blind_impl(env, bin, max_depth, max_elements, max_message_bytes)
+}
+
+fn decode_blind_json_impl<'a>(
     env: Env<'a>,
     bin: Binary<'a>,
     max_depth: usize,
@@ -203,7 +232,7 @@ fn nif_decode_blind_json<'a>(
         inherited_schema: None,
         max_message_bytes,
         max_elements,
-        max_alloc_bytes: max_message_bytes.max(64 * 1024 * 1024),
+        max_alloc_bytes: blind_alloc_limit(max_message_bytes),
         max_depth: max_depth.min(MAX_NESTING_DEPTH),
     };
 
@@ -223,6 +252,28 @@ fn nif_decode_blind_json<'a>(
         }
         Err(err) => omnibuf_err_tuple(env, err),
     }
+}
+
+#[rustler::nif]
+fn nif_decode_blind_json<'a>(
+    env: Env<'a>,
+    bin: Binary<'a>,
+    max_depth: usize,
+    max_elements: usize,
+    max_message_bytes: usize,
+) -> Term<'a> {
+    decode_blind_json_impl(env, bin, max_depth, max_elements, max_message_bytes)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn nif_decode_blind_json_dirty<'a>(
+    env: Env<'a>,
+    bin: Binary<'a>,
+    max_depth: usize,
+    max_elements: usize,
+    max_message_bytes: usize,
+) -> Term<'a> {
+    decode_blind_json_impl(env, bin, max_depth, max_elements, max_message_bytes)
 }
 
 fn contains_non_finite(map: &BTreeMap<String, BlindValue>) -> bool {
@@ -407,8 +458,7 @@ fn nif_opaque_extract_submsg<'a>(env: Env<'a>, bin: Binary<'a>, target_field: u3
     }
 }
 
-#[rustler::nif]
-fn nif_opaque_splice<'a>(env: Env<'a>, packet: Binary<'a>, dirty_list: Term<'a>) -> Term<'a> {
+fn opaque_splice_impl<'a>(env: Env<'a>, packet: Binary<'a>, dirty_list: Term<'a>) -> Term<'a> {
     let raw = packet.as_slice();
     let Ok(iter) = dirty_list.decode::<ListIterator<'a>>() else {
         return err_tuple(env, DecodeErr::new(atoms::parse_error(), "invalid dirty list"));
@@ -580,6 +630,20 @@ fn nif_opaque_splice<'a>(env: Env<'a>, packet: Binary<'a>, dirty_list: Term<'a>)
     }
 }
 
+#[rustler::nif]
+fn nif_opaque_splice<'a>(env: Env<'a>, packet: Binary<'a>, dirty_list: Term<'a>) -> Term<'a> {
+    opaque_splice_impl(env, packet, dirty_list)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn nif_opaque_splice_dirty<'a>(
+    env: Env<'a>,
+    packet: Binary<'a>,
+    dirty_list: Term<'a>,
+) -> Term<'a> {
+    opaque_splice_impl(env, packet, dirty_list)
+}
+
 // ---------------------------------------------------------------------------
 // Fast Struct Schema Compilation, Encode & Decode NIFs
 // ---------------------------------------------------------------------------
@@ -599,7 +663,7 @@ fn nif_encode_struct<'a>(
     ENCODE_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.clear();
-        let res = schema::encode_message(&schema, 0, msg, &mut buf);
+        let res = schema::encode_message(&schema, 0, msg, &mut buf, 0);
         let out = res.map(|()| make_bytes(env, &buf));
         if buf.capacity() > MAX_RETAINED_SCRATCH {
             buf.clear();
@@ -609,13 +673,52 @@ fn nif_encode_struct<'a>(
     })
 }
 
+fn decode_struct_impl<'a>(
+    env: Env<'a>,
+    schema: ResourceArc<CompiledSchema>,
+    bin: Binary<'a>,
+) -> Term<'a> {
+    let mut budget = DecodeBudget::new(DEFAULT_MAX_ELEMENTS);
+    match schema::decode_message(env, &schema, 0, bin.as_slice(), None, 0, &mut budget) {
+        Ok(term) => (atoms::ok(), term).encode(env),
+        Err(err) => err_tuple(env, err),
+    }
+}
+
 #[rustler::nif]
 fn nif_decode_struct<'a>(
     env: Env<'a>,
     schema: ResourceArc<CompiledSchema>,
     bin: Binary<'a>,
 ) -> Term<'a> {
-    match schema::decode_message(env, &schema, 0, bin.as_slice(), None, 0) {
+    decode_struct_impl(env, schema, bin)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn nif_decode_struct_dirty<'a>(
+    env: Env<'a>,
+    schema: ResourceArc<CompiledSchema>,
+    bin: Binary<'a>,
+) -> Term<'a> {
+    decode_struct_impl(env, schema, bin)
+}
+
+fn merge_struct_impl<'a>(
+    env: Env<'a>,
+    schema: ResourceArc<CompiledSchema>,
+    existing: Term<'a>,
+    bin: Binary<'a>,
+) -> Term<'a> {
+    let mut budget = DecodeBudget::new(DEFAULT_MAX_ELEMENTS);
+    match schema::decode_message(
+        env,
+        &schema,
+        0,
+        bin.as_slice(),
+        Some(existing),
+        0,
+        &mut budget,
+    ) {
         Ok(term) => (atoms::ok(), term).encode(env),
         Err(err) => err_tuple(env, err),
     }
@@ -628,10 +731,17 @@ fn nif_merge_struct<'a>(
     existing: Term<'a>,
     bin: Binary<'a>,
 ) -> Term<'a> {
-    match schema::decode_message(env, &schema, 0, bin.as_slice(), Some(existing), 0) {
-        Ok(term) => (atoms::ok(), term).encode(env),
-        Err(err) => err_tuple(env, err),
-    }
+    merge_struct_impl(env, schema, existing, bin)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn nif_merge_struct_dirty<'a>(
+    env: Env<'a>,
+    schema: ResourceArc<CompiledSchema>,
+    existing: Term<'a>,
+    bin: Binary<'a>,
+) -> Term<'a> {
+    merge_struct_impl(env, schema, existing, bin)
 }
 
 rustler::init!("Elixir.OmniBuf.Native.NIF", load = on_load);

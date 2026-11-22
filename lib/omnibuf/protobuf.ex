@@ -49,10 +49,11 @@ defmodule OmniBuf.Protobuf do
   @doc """
   Builds an `OmniBuf.SchemaMeta` from an `elixir-protobuf` module's `__message_props__/0`.
   """
-  @spec schema_meta(module(), MapSet.t()) :: SchemaMeta.t()
-  def schema_meta(mod, visited \\ MapSet.new()) do
+  @spec schema_meta(module(), MapSet.t(), non_neg_integer()) :: SchemaMeta.t()
+  def schema_meta(mod, visited \\ MapSet.new(), depth \\ 1) do
     visited = MapSet.put(visited, mod)
     props = mod.__message_props__()
+    allow_children? = depth + 2 <= Wire.max_depth()
 
     {fields, children} =
       Enum.reduce(props.field_props, {%{}, %{}}, fn {fnum, fp}, {f_acc, c_acc} ->
@@ -60,18 +61,21 @@ defmodule OmniBuf.Protobuf do
 
         c_acc =
           cond do
+            not allow_children? ->
+              c_acc
+
             fp.map? ->
               entry_props = fp.type.__message_props__()
               val_fp = Map.fetch!(entry_props.field_props, 2)
 
               if val_fp.embedded? and not MapSet.member?(visited, val_fp.type) do
-                Map.put(c_acc, fnum, schema_meta(val_fp.type, visited))
+                Map.put(c_acc, fnum, schema_meta(val_fp.type, visited, depth + 2))
               else
                 c_acc
               end
 
             fp.embedded? and not MapSet.member?(visited, fp.type) ->
-              Map.put(c_acc, fnum, schema_meta(fp.type, visited))
+              Map.put(c_acc, fnum, schema_meta(fp.type, visited, depth + 2))
 
             true ->
               c_acc
@@ -243,16 +247,36 @@ defmodule OmniBuf.Protobuf do
   defp decode_into(bin, acc, mod, depth) do
     props = mod.__message_props__()
     oneof_names = Map.new(props.oneof, fn {name, idx} -> {idx, name} end)
-    decode_loop(bin, acc, props, oneof_names, depth)
+    decode_loop(bin, acc, %{}, props, oneof_names, depth)
   end
 
-  defp decode_loop(<<>>, acc, _props, _oneof_names, _depth), do: {:ok, acc}
+  defp decode_loop(<<>>, acc, array_chunks, _props, _oneof_names, _depth)
+       when map_size(array_chunks) == 0,
+       do: {:ok, acc}
 
-  defp decode_loop(bin, acc, props, oneof_names, depth) do
+  defp decode_loop(<<>>, acc, array_chunks, _props, _oneof_names, _depth) do
+    acc =
+      Enum.reduce(array_chunks, acc, fn {name, rev_chunks}, struct_acc ->
+        existing = Map.get(struct_acc, name) || []
+
+        appended =
+          case rev_chunks do
+            [single] -> single
+            many -> many |> Enum.reverse() |> :lists.append()
+          end
+
+        merged = if existing == [], do: appended, else: existing ++ appended
+        Map.put(struct_acc, name, merged)
+      end)
+
+    {:ok, acc}
+  end
+
+  defp decode_loop(bin, acc, array_chunks, props, oneof_names, depth) do
     case Wire.decode_tag(bin) do
       {:ok, 0, 12, rest} ->
         case SchemaMeta.decode_field(rest, depth) do
-          {:ok, _meta, tail} -> decode_loop(tail, acc, props, oneof_names, depth)
+          {:ok, _meta, tail} -> decode_loop(tail, acc, array_chunks, props, oneof_names, depth)
           {:error, _} = err -> err
         end
 
@@ -260,14 +284,17 @@ defmodule OmniBuf.Protobuf do
         case Map.get(props.field_props, field_num) do
           nil ->
             case Wire.skip_validated(wt, rest, depth) do
-              {:ok, tail} -> decode_loop(tail, acc, props, oneof_names, depth)
+              {:ok, tail} -> decode_loop(tail, acc, array_chunks, props, oneof_names, depth)
               {:error, _} = err -> err
             end
 
           fp ->
-            case decode_known_field(fp, wt, rest, acc, oneof_names, depth) do
-              {:ok, new_acc, tail} -> decode_loop(tail, new_acc, props, oneof_names, depth)
-              {:error, _} = err -> err
+            case decode_known_field(fp, wt, rest, acc, array_chunks, oneof_names, depth) do
+              {:ok, new_acc, new_chunks, tail} ->
+                decode_loop(tail, new_acc, new_chunks, props, oneof_names, depth)
+
+              {:error, _} = err ->
+                err
             end
         end
 
@@ -276,7 +303,7 @@ defmodule OmniBuf.Protobuf do
     end
   end
 
-  defp decode_known_field(%{map?: true} = fp, 14, rest, acc, _oneof_names, depth) do
+  defp decode_known_field(%{map?: true} = fp, 14, rest, acc, array_chunks, _oneof_names, depth) do
     if depth + 1 > Wire.max_depth() do
       Error.parse(:max_depth_exceeded, "max container depth #{Wire.max_depth()} exceeded")
     else
@@ -297,7 +324,7 @@ defmodule OmniBuf.Protobuf do
 
           with {:ok, merged} <-
                  decode_pb_map_pairs(key_fp, val_fp, count, entry_bytes, depth + 1, existing) do
-            {:ok, Map.put(acc, fp.name_atom, merged), tail}
+            {:ok, Map.put(acc, fp.name_atom, merged), array_chunks, tail}
           end
         end
       end
@@ -309,6 +336,7 @@ defmodule OmniBuf.Protobuf do
          13,
          rest,
          acc,
+         array_chunks,
          _oneof_names,
          depth
        ) do
@@ -325,9 +353,8 @@ defmodule OmniBuf.Protobuf do
           )
         else
           with {:ok, items} <- decode_pb_array_elems(fp, count, elem_bytes, depth + 1, []) do
-            existing = Map.get(acc, fp.name_atom) || []
-            merged = if existing == [], do: items, else: existing ++ items
-            {:ok, Map.put(acc, fp.name_atom, merged), tail}
+            array_chunks = Map.update(array_chunks, fp.name_atom, [items], &[items | &1])
+            {:ok, acc, array_chunks, tail}
           end
         end
       end
@@ -339,6 +366,7 @@ defmodule OmniBuf.Protobuf do
          12,
          rest,
          acc,
+         array_chunks,
          oneof_names,
          depth
        ) do
@@ -361,7 +389,7 @@ defmodule OmniBuf.Protobuf do
 
       with {:ok, body, tail} <- Wire.decode_length_prefixed(rest),
            {:ok, sub} <- decode_into(body, existing || struct(fp.type), fp.type, depth + 1) do
-        {:ok, put_pb_field(acc, fp, sub, oneof_names), tail}
+        {:ok, put_pb_field(acc, fp, sub, oneof_names), array_chunks, tail}
       end
     end
   end
@@ -371,11 +399,12 @@ defmodule OmniBuf.Protobuf do
          wt,
          rest,
          acc,
+         array_chunks,
          oneof_names,
          _depth
        )
        when wt in [2, 3] do
-    {:ok, put_pb_field(acc, fp, wt == 3, oneof_names), rest}
+    {:ok, put_pb_field(acc, fp, wt == 3, oneof_names), array_chunks, rest}
   end
 
   defp decode_known_field(
@@ -383,6 +412,7 @@ defmodule OmniBuf.Protobuf do
          wt,
          rest,
          acc,
+         array_chunks,
          oneof_names,
          depth
        ) do
@@ -390,20 +420,23 @@ defmodule OmniBuf.Protobuf do
 
     if wt == expected_wt do
       case decode_pb_element(fp, rest, depth) do
-        {:ok, val, tail} -> {:ok, put_pb_field(acc, fp, val, oneof_names), tail}
-        {:error, _} = err -> err
+        {:ok, val, tail} ->
+          {:ok, put_pb_field(acc, fp, val, oneof_names), array_chunks, tail}
+
+        {:error, _} = err ->
+          err
       end
     else
       case Wire.skip_validated(wt, rest, depth) do
-        {:ok, tail} -> {:ok, acc, tail}
+        {:ok, tail} -> {:ok, acc, array_chunks, tail}
         {:error, _} = err -> err
       end
     end
   end
 
-  defp decode_known_field(_fp, wt, rest, acc, _oneof_names, depth) do
+  defp decode_known_field(_fp, wt, rest, acc, array_chunks, _oneof_names, depth) do
     case Wire.skip_validated(wt, rest, depth) do
-      {:ok, tail} -> {:ok, acc, tail}
+      {:ok, tail} -> {:ok, acc, array_chunks, tail}
       {:error, _} = err -> err
     end
   end

@@ -79,12 +79,29 @@ defmodule OmniBuf.SchemaMeta do
   @spec decode_field(binary(), non_neg_integer()) ::
           {:ok, t(), binary()} | {:error, Error.t()}
   def decode_field(bin, depth) do
-    if depth + 1 > Wire.max_depth() do
+    budget = %{
+      max_depth: Wire.max_depth(),
+      max_elements: Wire.default_max_elements(),
+      elements: 0
+    }
+
+    case decode_field(bin, depth, budget) do
+      {:ok, meta, rest, _budget} -> {:ok, meta, rest}
+      {:error, _} = err -> err
+    end
+  end
+
+  @doc false
+  @spec decode_field(binary(), non_neg_integer(), map()) ::
+          {:ok, t(), binary(), map()} | {:error, Error.t()}
+  def decode_field(bin, depth, %{max_depth: max_depth} = budget) do
+    if depth + 1 > max_depth do
       Error.parse(:max_depth_exceeded, "max depth exceeded in Field #0 SchemaMeta")
     else
       with {:ok, body, rest} <- Wire.decode_length_prefixed(bin),
-           {:ok, meta} <- decode_body(body, depth + 1, %__MODULE__{}) do
-        {:ok, meta, rest}
+           {:ok, meta, new_budget} <-
+             decode_body_with_budget(body, depth + 1, %__MODULE__{}, budget) do
+        {:ok, meta, rest, new_budget}
       end
     end
   end
@@ -93,50 +110,78 @@ defmodule OmniBuf.SchemaMeta do
   Decodes the inner field stream of a `SchemaMeta` message.
   """
   @spec decode_body(binary(), non_neg_integer(), t()) :: {:ok, t()} | {:error, Error.t()}
-  def decode_body(<<>>, _depth, acc), do: {:ok, acc}
-
   def decode_body(bin, depth, acc) do
+    budget = %{
+      max_depth: Wire.max_depth(),
+      max_elements: Wire.default_max_elements(),
+      elements: 0
+    }
+
+    case decode_body_with_budget(bin, depth, acc, budget) do
+      {:ok, meta, _budget} -> {:ok, meta}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp decode_body_with_budget(<<>>, _depth, acc, budget), do: {:ok, acc, budget}
+
+  defp decode_body_with_budget(bin, depth, acc, %{max_depth: max_depth} = budget) do
     with {:ok, field_num, wt, rest} <- Wire.decode_tag(bin) do
       case {field_num, wt} do
         {0, 12} ->
-          with {:ok, _nested_meta, tail} <- decode_field(rest, depth) do
-            decode_body(tail, depth, acc)
+          with {:ok, _nested_meta, tail, new_budget} <- decode_field(rest, depth, budget) do
+            decode_body_with_budget(tail, depth, acc, new_budget)
           end
 
         {1, 10} ->
           with {:ok, name, tail} <- Wire.decode_string(rest) do
             acc = if name != "", do: %{acc | type_name: name}, else: acc
-            decode_body(tail, depth, acc)
+            decode_body_with_budget(tail, depth, acc, budget)
           end
 
         {2, 14} ->
-          if depth + 1 > Wire.max_depth() do
+          if depth + 1 > max_depth do
             Error.parse(:max_depth_exceeded, "max depth exceeded in SchemaMeta.fields")
           else
-            with {:ok, kt, vt, count, entries_bin, tail} <- Wire.decode_map_header(rest),
+            with {:ok, kt, vt, count, entries_bin, tail} <-
+                   Wire.decode_map_header(rest, budget.max_elements),
                  :ok <- check_fields_map_types(kt, vt),
+                 {:ok, budget} <- add_meta_elements(budget, count),
                  {:ok, new_fields} <- decode_fields_map(entries_bin, count, acc.fields) do
-              decode_body(tail, depth, %{acc | fields: new_fields})
+              decode_body_with_budget(tail, depth, %{acc | fields: new_fields}, budget)
             end
           end
 
         {3, 14} ->
-          if depth + 1 > Wire.max_depth() do
+          if depth + 1 > max_depth do
             Error.parse(:max_depth_exceeded, "max depth exceeded in SchemaMeta.children")
           else
-            with {:ok, kt, vt, count, entries_bin, tail} <- Wire.decode_map_header(rest),
+            with {:ok, kt, vt, count, entries_bin, tail} <-
+                   Wire.decode_map_header(rest, budget.max_elements),
                  :ok <- check_children_map_types(kt, vt),
-                 {:ok, new_children} <-
-                   decode_children_map(entries_bin, count, depth + 1, acc.children) do
-              decode_body(tail, depth, %{acc | children: new_children})
+                 {:ok, budget} <- add_meta_elements(budget, count),
+                 {:ok, new_children, new_budget} <-
+                   decode_children_map(entries_bin, count, depth + 1, acc.children, budget) do
+              decode_body_with_budget(tail, depth, %{acc | children: new_children}, new_budget)
             end
           end
 
         {_unknown, _wt} ->
-          with {:ok, tail} <- Wire.skip_validated(wt, rest, depth) do
-            decode_body(tail, depth, acc)
+          with {:ok, tail, new_budget} <-
+                 Wire.skip_validated_with_budget(wt, rest, depth, budget) do
+            decode_body_with_budget(tail, depth, acc, new_budget)
           end
       end
+    end
+  end
+
+  defp add_meta_elements(%{elements: el, max_elements: max} = budget, count) do
+    next = el + count
+
+    if next > max do
+      Error.parse(:element_limit_exceeded, "cumulative element count #{next} exceeds #{max}")
+    else
+      {:ok, %{budget | elements: next}}
     end
   end
 
@@ -172,25 +217,27 @@ defmodule OmniBuf.SchemaMeta do
     end
   end
 
-  defp decode_children_map(<<>>, 0, _map_depth, acc), do: {:ok, acc}
+  defp decode_children_map(<<>>, 0, _map_depth, acc, budget), do: {:ok, acc, budget}
 
-  defp decode_children_map(_bin, 0, _map_depth, _acc) do
+  defp decode_children_map(_bin, 0, _map_depth, _acc, _budget) do
     Error.parse(:trailing_bytes, "trailing bytes in SchemaMeta.children")
   end
 
-  defp decode_children_map(bin, count, map_depth, acc) do
-    if map_depth + 1 > Wire.max_depth() do
+  defp decode_children_map(bin, count, map_depth, acc, %{max_depth: max_depth} = budget) do
+    if map_depth + 1 > max_depth do
       Error.parse(:max_depth_exceeded, "max depth exceeded in SchemaMeta.children value")
     else
       with {:ok, field_num, after_k} <- Wire.decode_varint(bin),
            :ok <- validate_meta_field_key(field_num),
            {:ok, child_body, after_v} <- Wire.decode_length_prefixed(after_k),
-           {:ok, child_meta} <- decode_body(child_body, map_depth + 1, %__MODULE__{}) do
+           {:ok, child_meta, new_budget} <-
+             decode_body_with_budget(child_body, map_depth + 1, %__MODULE__{}, budget) do
         decode_children_map(
           after_v,
           count - 1,
           map_depth,
-          Map.put(acc, field_num, child_meta)
+          Map.put(acc, field_num, child_meta),
+          new_budget
         )
       end
     end

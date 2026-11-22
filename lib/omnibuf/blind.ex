@@ -310,28 +310,51 @@ defmodule OmniBuf.Blind do
   defp decode_message(<<>>, _inherited, _depth, budget), do: {:ok, %{}, budget}
 
   defp decode_message(bin, inherited, depth, budget) do
-    with {:ok, local_meta} <- prescan_field_zero(bin, depth, nil) do
+    with {:ok, local_meta, budget} <- prescan_field_zero(bin, depth, nil, budget) do
       active_meta = SchemaMeta.merge(inherited, local_meta)
-      state = %{out: %{}, sub_packets: %{}, shapes: %{}, owners: %{}, budget: budget}
+
+      state = %{
+        out: %{},
+        array_chunks: %{},
+        sub_packets: %{},
+        shapes: %{},
+        owners: %{},
+        budget: budget
+      }
 
       with {:ok, state} <- decode_fields_loop(bin, active_meta, depth, state) do
-        resolve_sub_packets(state.sub_packets, active_meta, depth, state.out, state.budget)
+        out = finalize_array_chunks(state.array_chunks, state.out)
+        resolve_sub_packets(state.sub_packets, active_meta, depth, out, state.budget)
       end
     end
   end
 
-  # Pass 1: Pre-scan all Field #0 blocks so trailing metadata renames earlier fields consistently.
-  defp prescan_field_zero(<<>>, _depth, acc), do: {:ok, acc}
+  defp finalize_array_chunks(array_chunks, out) when map_size(array_chunks) == 0, do: out
 
-  defp prescan_field_zero(bin, depth, acc) do
+  defp finalize_array_chunks(array_chunks, out) do
+    Enum.reduce(array_chunks, out, fn {name, rev_chunks}, acc_out ->
+      list =
+        case rev_chunks do
+          [single] -> single
+          many -> many |> Enum.reverse() |> :lists.append()
+        end
+
+      Map.put(acc_out, name, list)
+    end)
+  end
+
+  # Pass 1: Pre-scan all Field #0 blocks so trailing metadata renames earlier fields consistently.
+  defp prescan_field_zero(<<>>, _depth, acc, budget), do: {:ok, acc, budget}
+
+  defp prescan_field_zero(bin, depth, acc, budget) do
     with {:ok, field_num, wt, rest} <- Wire.decode_tag(bin) do
       if field_num == 0 do
-        with {:ok, meta, tail} <- SchemaMeta.decode_field(rest, depth) do
-          prescan_field_zero(tail, depth, SchemaMeta.merge(acc, meta))
+        with {:ok, meta, tail, new_budget} <- SchemaMeta.decode_field(rest, depth, budget) do
+          prescan_field_zero(tail, depth, SchemaMeta.merge(acc, meta), new_budget)
         end
       else
         with {:ok, tail} <- Wire.skip_fast(wt, rest) do
-          prescan_field_zero(tail, depth, acc)
+          prescan_field_zero(tail, depth, acc, budget)
         end
       end
     end
@@ -349,7 +372,7 @@ defmodule OmniBuf.Blind do
         name = SchemaMeta.resolve_field_name(meta, field_num)
 
         with :ok <- check_owner(state.owners, name, field_num),
-             {:ok, shape} <- parse_field_shape(rest, wt, depth, state.budget.max_depth),
+             {:ok, shape} <- parse_field_shape(rest, wt, depth, state.budget),
              {:ok, unified_shape} <- unify_field_shape(Map.get(state.shapes, field_num), shape) do
           owners = Map.put(state.owners, name, field_num)
           shapes = Map.put(state.shapes, field_num, unified_shape)
@@ -497,7 +520,8 @@ defmodule OmniBuf.Blind do
           {^name, existing_chunks} ->
             # Validate both prior (if first concat) and incoming chunks individually so a
             # truncated submessage cannot borrow bytes across chunk boundaries.
-            with :ok <- validate_chunks_for_concat(existing_chunks, sub_bytes, depth + 1) do
+            with :ok <-
+                   validate_chunks_for_concat(existing_chunks, sub_bytes, depth + 1, state.budget) do
               sub_packets =
                 Map.put(state.sub_packets, fnum, {name, [sub_bytes | existing_chunks]})
 
@@ -513,14 +537,14 @@ defmodule OmniBuf.Blind do
       Error.parse(:max_depth_exceeded, "max container depth #{state.budget.max_depth} exceeded")
     else
       child_meta = SchemaMeta.child_meta(meta, fnum)
-      existing = Map.get(state.out, name, [])
 
       with {:ok, elem_type, count, elem_bytes, tail} <-
              Wire.decode_array_header(rest, state.budget.max_elements),
            {:ok, budget} <- add_elements(state.budget, count),
            {:ok, items, budget} <-
              decode_array_items(elem_type, count, elem_bytes, child_meta, depth + 1, budget, []) do
-        {:ok, tail, %{state | out: Map.put(state.out, name, existing ++ items), budget: budget}}
+        array_chunks = Map.update(state.array_chunks, name, [items], &[items | &1])
+        {:ok, tail, %{state | array_chunks: array_chunks, budget: budget}}
       end
     end
   end
@@ -564,15 +588,18 @@ defmodule OmniBuf.Blind do
     end
   end
 
-  defp validate_chunks_for_concat([single], incoming, depth) do
-    with :ok <- Wire.validate_message_stream(single, depth),
-         :ok <- Wire.validate_message_stream(incoming, depth) do
+  defp validate_chunks_for_concat([single], incoming, depth, budget) do
+    with {:ok, budget} <- Wire.validate_message_stream_with_budget(single, depth, budget),
+         {:ok, _budget} <- Wire.validate_message_stream_with_budget(incoming, depth, budget) do
       :ok
     end
   end
 
-  defp validate_chunks_for_concat(_already_validated_list, incoming, depth) do
-    Wire.validate_message_stream(incoming, depth)
+  defp validate_chunks_for_concat(_already_validated_list, incoming, depth, budget) do
+    case Wire.validate_message_stream_with_budget(incoming, depth, budget) do
+      {:ok, _budget} -> :ok
+      {:error, _} = err -> err
+    end
   end
 
   defp resolve_sub_packets(sub_packets, meta, depth, out, budget) do
@@ -809,89 +836,94 @@ defmodule OmniBuf.Blind do
   # Blind Field Shape Consistency
   # ---------------------------------------------------------------------------
 
-  defp parse_field_shape(_rest, 3, _depth, _max_depth), do: {:ok, {:scalar, 2}}
+  defp parse_field_shape(_rest, 3, _depth, _budget), do: {:ok, {:scalar, 2}}
 
-  defp parse_field_shape(_rest, wt, _depth, _max_depth) when wt not in [13, 14],
+  defp parse_field_shape(_rest, wt, _depth, _budget) when wt not in [13, 14],
     do: {:ok, {:scalar, wt}}
 
-  defp parse_field_shape(rest, wt, depth, max_depth) do
-    case parse_container_shape(rest, wt, depth, max_depth) do
-      {:ok, shape, _tail} -> {:ok, shape}
+  defp parse_field_shape(rest, wt, depth, budget) do
+    case parse_container_shape(rest, wt, depth, budget) do
+      {:ok, shape, _tail, _shape_budget} -> {:ok, shape}
       {:error, _} = err -> err
     end
   end
 
-  defp parse_container_shape(_bin, _wt, depth, max_depth) when depth + 1 > max_depth do
+  defp parse_container_shape(_bin, _wt, depth, %{max_depth: max_depth})
+       when depth + 1 > max_depth do
     Error.parse(:max_depth_exceeded, "max container depth #{max_depth} exceeded")
   end
 
-  defp parse_container_shape(bin, 13, depth, max_depth) do
-    with {:ok, elem_type, count, elem_bytes, tail} <- Wire.decode_array_header(bin) do
+  defp parse_container_shape(bin, 13, depth, budget) do
+    with {:ok, elem_type, count, elem_bytes, tail} <-
+           Wire.decode_array_header(bin, budget.max_elements),
+         {:ok, budget} <- add_elements(budget, count) do
       cond do
         elem_type not in [13, 14] ->
-          {:ok, {:array, {:scalar, elem_type}}, tail}
+          {:ok, {:array, {:scalar, elem_type}}, tail, budget}
 
         count == 0 ->
           inner = if elem_type == 13, do: {:array, :any}, else: {:map, :any, :any}
-          {:ok, {:array, inner}, tail}
+          {:ok, {:array, inner}, tail, budget}
 
         true ->
-          with {:ok, unified_elem} <-
+          with {:ok, unified_elem, budget} <-
                  parse_nested_array_shapes(
                    elem_bytes,
                    elem_type,
                    count,
                    depth + 1,
-                   max_depth,
+                   budget,
                    nil
                  ) do
-            {:ok, {:array, unified_elem}, tail}
+            {:ok, {:array, unified_elem}, tail, budget}
           end
       end
     end
   end
 
-  defp parse_container_shape(bin, 14, depth, max_depth) do
-    with {:ok, kt, vt, count, entry_bytes, tail} <- Wire.decode_map_header(bin) do
+  defp parse_container_shape(bin, 14, depth, budget) do
+    with {:ok, kt, vt, count, entry_bytes, tail} <-
+           Wire.decode_map_header(bin, budget.max_elements),
+         {:ok, budget} <- add_elements(budget, count) do
       cond do
         vt not in [13, 14] ->
-          {:ok, {:map, kt, {:scalar, vt}}, tail}
+          {:ok, {:map, kt, {:scalar, vt}}, tail, budget}
 
         count == 0 ->
           inner = if vt == 13, do: {:array, :any}, else: {:map, :any, :any}
-          {:ok, {:map, kt, inner}, tail}
+          {:ok, {:map, kt, inner}, tail, budget}
 
         true ->
-          with {:ok, unified_val} <-
-                 parse_nested_map_shapes(entry_bytes, kt, vt, count, depth + 1, max_depth, nil) do
-            {:ok, {:map, kt, unified_val}, tail}
+          with {:ok, unified_val, budget} <-
+                 parse_nested_map_shapes(entry_bytes, kt, vt, count, depth + 1, budget, nil) do
+            {:ok, {:map, kt, unified_val}, tail, budget}
           end
       end
     end
   end
 
-  defp parse_nested_array_shapes(<<>>, _elem_type, 0, _depth, _max_depth, acc), do: {:ok, acc}
+  defp parse_nested_array_shapes(<<>>, _elem_type, 0, _depth, budget, acc), do: {:ok, acc, budget}
 
-  defp parse_nested_array_shapes(_trailing, _elem_type, 0, _depth, _max_depth, _acc),
+  defp parse_nested_array_shapes(_trailing, _elem_type, 0, _depth, _budget, _acc),
     do: Error.parse(:trailing_bytes, "trailing bytes in nested WireArray")
 
-  defp parse_nested_array_shapes(bin, elem_type, count, depth, max_depth, acc) do
-    with {:ok, shape, rest} <- parse_container_shape(bin, elem_type, depth, max_depth),
+  defp parse_nested_array_shapes(bin, elem_type, count, depth, budget, acc) do
+    with {:ok, shape, rest, budget} <- parse_container_shape(bin, elem_type, depth, budget),
          {:ok, unified} <- unify_field_shape(acc, shape) do
-      parse_nested_array_shapes(rest, elem_type, count - 1, depth, max_depth, unified)
+      parse_nested_array_shapes(rest, elem_type, count - 1, depth, budget, unified)
     end
   end
 
-  defp parse_nested_map_shapes(<<>>, _kt, _vt, 0, _depth, _max_depth, acc), do: {:ok, acc}
+  defp parse_nested_map_shapes(<<>>, _kt, _vt, 0, _depth, budget, acc), do: {:ok, acc, budget}
 
-  defp parse_nested_map_shapes(_trailing, _kt, _vt, 0, _depth, _max_depth, _acc),
+  defp parse_nested_map_shapes(_trailing, _kt, _vt, 0, _depth, _budget, _acc),
     do: Error.parse(:trailing_bytes, "trailing bytes in nested WireMap")
 
-  defp parse_nested_map_shapes(bin, kt, vt, count, depth, max_depth, acc) do
+  defp parse_nested_map_shapes(bin, kt, vt, count, depth, budget, acc) do
     with {:ok, _k, after_k} <- decode_map_key(kt, bin),
-         {:ok, shape, rest} <- parse_container_shape(after_k, vt, depth, max_depth),
+         {:ok, shape, rest, budget} <- parse_container_shape(after_k, vt, depth, budget),
          {:ok, unified} <- unify_field_shape(acc, shape) do
-      parse_nested_map_shapes(rest, kt, vt, count - 1, depth, max_depth, unified)
+      parse_nested_map_shapes(rest, kt, vt, count - 1, depth, budget, unified)
     end
   end
 
