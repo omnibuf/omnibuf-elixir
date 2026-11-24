@@ -1,9 +1,9 @@
 defmodule OmniBuf.GRPC.Codec do
   @moduledoc """
-  Detached `GRPC.Codec` implementation for OmniBuf wire payloads (`application/grpc+omnibuf`).
+  `GRPC.Codec` implementation for OmniBuf wire payloads (`application/grpc+omnibuf`).
 
-  Requires no compile-time or runtime dependency on `:grpc`. Supports `OmniBuf.Schema`
-  modules, `protoc-gen-omnibuf-elixir` generated modules, and `elixir-protobuf` structs.
+  Supports `OmniBuf.Schema` modules, `protoc-gen-omnibuf-elixir` generated modules,
+  and `elixir-protobuf` structs.
   """
 
   @doc """
@@ -67,7 +67,7 @@ end
 
 defmodule OmniBuf.GRPC.SelfDescribingCodec do
   @moduledoc """
-  Detached `GRPC.Codec` implementation for self-describing OmniBuf payloads
+  `GRPC.Codec` implementation for self-describing OmniBuf payloads
   (`application/grpc+x-omnibuf`) carrying Field #0 schema metadata.
   """
 
