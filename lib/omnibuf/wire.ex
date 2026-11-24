@@ -29,7 +29,10 @@ defmodule OmniBuf.Wire do
   @max_field_number 536_870_911
   @max_depth 32
   @default_max_elements 4_194_304
-  @uint64_mask 0xFFFF_FFFF_FFFF_FFFF
+  @default_max_message_bytes 64 * 1024 * 1024
+  @uint64_max 0xFFFF_FFFF_FFFF_FFFF
+  @int64_min -9_223_372_036_854_775_808
+  @int64_max 9_223_372_036_854_775_807
   @uint32_mask 0xFFFF_FFFF
 
   @compile {:inline,
@@ -63,6 +66,51 @@ defmodule OmniBuf.Wire do
   def max_field_number, do: @max_field_number
   def max_depth, do: @max_depth
   def default_max_elements, do: @default_max_elements
+  def default_max_message_bytes, do: @default_max_message_bytes
+
+  @doc """
+  Builds a cumulative decode budget map from keyword options:
+  - `:max_depth` (default `32`, capped at `32`, must be `>= 1`)
+  - `:max_elements` (default `4_194_304`, must be `>= 0`)
+  - `:max_message_bytes` (default `64 MiB`, must be `>= 0`)
+  """
+  @spec new_budget(keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def new_budget(opts \\ []) when is_list(opts) do
+    max_depth = Keyword.get(opts, :max_depth, @max_depth)
+    max_elements = Keyword.get(opts, :max_elements, @default_max_elements)
+    max_message_bytes = Keyword.get(opts, :max_message_bytes, @default_max_message_bytes)
+
+    cond do
+      not is_integer(max_depth) or max_depth < 1 ->
+        Error.parse(:invalid_option, "max_depth must be an integer >= 1")
+
+      not is_integer(max_elements) or max_elements < 0 ->
+        Error.parse(:invalid_option, "max_elements must be an integer >= 0")
+
+      not is_integer(max_message_bytes) or max_message_bytes < 0 ->
+        Error.parse(:invalid_option, "max_message_bytes must be an integer >= 0")
+
+      true ->
+        {:ok,
+         %{
+           max_depth: min(max_depth, @max_depth),
+           max_elements: max_elements,
+           max_message_bytes: max_message_bytes,
+           elements: 0
+         }}
+    end
+  end
+
+  @doc false
+  @spec default_budget() :: map()
+  def default_budget do
+    %{
+      max_depth: @max_depth,
+      max_elements: @default_max_elements,
+      max_message_bytes: @default_max_message_bytes,
+      elements: 0
+    }
+  end
 
   # ---------------------------------------------------------------------------
   # Prefix-Varint Encoding & Decoding (1, 2, 4, or 9 bytes)
@@ -84,8 +132,12 @@ defmodule OmniBuf.Wire do
     <<bsl(v, 3) ||| 4::little-unsigned-32>>
   end
 
-  def encode_varint(v) when is_integer(v) and v >= 536_870_912 do
-    <<0, v &&& @uint64_mask::little-unsigned-64>>
+  def encode_varint(v) when is_integer(v) and v >= 536_870_912 and v <= @uint64_max do
+    <<0, v::little-unsigned-64>>
+  end
+
+  def encode_varint(v) do
+    raise ArgumentError, "varint value #{inspect(v)} out of uint64 range (0..#{@uint64_max})"
   end
 
   @doc """
@@ -167,12 +219,17 @@ defmodule OmniBuf.Wire do
   # ---------------------------------------------------------------------------
 
   @spec encode_zigzag(integer()) :: non_neg_integer()
-  def encode_zigzag(n) when is_integer(n) and n >= 0 do
-    bsl(n, 1) &&& @uint64_mask
+  def encode_zigzag(n) when is_integer(n) and n >= 0 and n <= @int64_max do
+    bsl(n, 1)
   end
 
-  def encode_zigzag(n) when is_integer(n) and n < 0 do
-    bsl(-n, 1) - 1 &&& @uint64_mask
+  def encode_zigzag(n) when is_integer(n) and n >= @int64_min and n < 0 do
+    bsl(-n, 1) - 1
+  end
+
+  def encode_zigzag(n) do
+    raise ArgumentError,
+          "zigzag value #{inspect(n)} out of int64 range (#{@int64_min}..#{@int64_max})"
   end
 
   @spec decode_zigzag(non_neg_integer()) :: integer()
@@ -515,14 +572,21 @@ defmodule OmniBuf.Wire do
   Skips a wire value while validating container bounds, nesting depth (max 32),
   and Field #0 wire type invariants inside unknown submessages.
   """
-  @spec skip_validated(0..15, binary(), non_neg_integer()) ::
+  @spec skip_validated(0..15, binary(), non_neg_integer(), keyword() | map()) ::
           {:ok, binary()} | {:error, Error.t()}
-  def skip_validated(wt, bin, depth) do
-    budget = %{max_depth: @max_depth, max_elements: @default_max_elements, elements: 0}
+  def skip_validated(wt, bin, depth, opts_or_budget \\ [])
 
+  def skip_validated(wt, bin, depth, %{} = budget) do
     case skip_validated_with_budget(wt, bin, depth, budget) do
       {:ok, rest, _budget} -> {:ok, rest}
       {:error, _} = err -> err
+    end
+  end
+
+  def skip_validated(wt, bin, depth, opts) when is_list(opts) do
+    with {:ok, budget} <- new_budget(opts),
+         {:ok, rest, _budget} <- skip_validated_with_budget(wt, bin, depth, budget) do
+      {:ok, rest}
     end
   end
 
@@ -622,7 +686,9 @@ defmodule OmniBuf.Wire do
     end
   end
 
-  defp add_budget_elements(%{elements: el, max_elements: max} = budget, count) do
+  @doc false
+  @spec add_budget_elements(map(), non_neg_integer()) :: {:ok, map()} | {:error, Error.t()}
+  def add_budget_elements(%{elements: el, max_elements: max} = budget, count) do
     next = el + count
 
     if next > max do

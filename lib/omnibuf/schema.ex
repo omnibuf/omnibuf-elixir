@@ -163,37 +163,110 @@ defmodule OmniBuf.Schema do
 
       @doc """
       Decodes an OmniBuf binary into a fresh `%#{inspect(__MODULE__)}{}` struct (replace mode).
+
+      Options:
+      - `:max_depth` - max container depth (default `32`, capped at `32`)
+      - `:max_elements` - max cumulative collection elements (default `4_194_304`)
+      - `:max_message_bytes` - max packet byte size (default `64 MiB`)
       """
-      def decode(bin) when is_binary(bin) do
-        if OmniBuf.Native.enabled?() do
-          OmniBuf.Native.decode_struct(__MODULE__, bin)
+      def decode(bin, opts \\ []) when is_binary(bin) and is_list(opts) do
+        if opts == [] and OmniBuf.Native.enabled?() do
+          if byte_size(bin) > Wire.default_max_message_bytes() do
+            OmniBuf.Error.parse(
+              :message_too_large,
+              "packet size #{byte_size(bin)} exceeds #{Wire.default_max_message_bytes()}"
+            )
+          else
+            OmniBuf.Native.decode_struct(__MODULE__, bin)
+          end
         else
-          decode_into(bin, %__MODULE__{}, 0)
+          with {:ok, budget} <- Wire.new_budget(opts) do
+            if byte_size(bin) > budget.max_message_bytes do
+              OmniBuf.Error.parse(
+                :message_too_large,
+                "packet size #{byte_size(bin)} exceeds #{budget.max_message_bytes}"
+              )
+            else
+              case decode_into(bin, %__MODULE__{}, 0, budget) do
+                {:ok, msg, _budget} -> {:ok, msg}
+                {:error, _} = err -> err
+              end
+            end
+          end
+        end
+      end
+
+      @doc """
+      Decodes an OmniBuf binary into a fresh `%#{inspect(__MODULE__)}{}` struct,
+      raising `OmniBuf.Error` on failure.
+      """
+      def decode!(bin, opts \\ []) when is_binary(bin) and is_list(opts) do
+        case decode(bin, opts) do
+          {:ok, msg} -> msg
+          {:error, err} -> raise err
         end
       end
 
       @doc """
       Merges an OmniBuf binary onto an existing `%#{inspect(__MODULE__)}{}` struct (merge mode).
       """
-      def merge(%__MODULE__{} = existing, bin) when is_binary(bin) do
-        if OmniBuf.Native.enabled?() do
-          OmniBuf.Native.merge_struct(__MODULE__, existing, bin)
+      def merge(%__MODULE__{} = existing, bin, opts \\ []) when is_binary(bin) and is_list(opts) do
+        if opts == [] and OmniBuf.Native.enabled?() do
+          if byte_size(bin) > Wire.default_max_message_bytes() do
+            OmniBuf.Error.parse(
+              :message_too_large,
+              "packet size #{byte_size(bin)} exceeds #{Wire.default_max_message_bytes()}"
+            )
+          else
+            OmniBuf.Native.merge_struct(__MODULE__, existing, bin)
+          end
         else
-          decode_into(bin, existing, 0)
+          with {:ok, budget} <- Wire.new_budget(opts) do
+            if byte_size(bin) > budget.max_message_bytes do
+              OmniBuf.Error.parse(
+                :message_too_large,
+                "packet size #{byte_size(bin)} exceeds #{budget.max_message_bytes}"
+              )
+            else
+              case decode_into(bin, existing, 0, budget) do
+                {:ok, msg, _budget} -> {:ok, msg}
+                {:error, _} = err -> err
+              end
+            end
+          end
+        end
+      end
+
+      @doc """
+      Merges an OmniBuf binary onto an existing `%#{inspect(__MODULE__)}{}` struct,
+      raising `OmniBuf.Error` on failure.
+      """
+      def merge!(%__MODULE__{} = existing, bin, opts \\ []) when is_binary(bin) and is_list(opts) do
+        case merge(existing, bin, opts) do
+          {:ok, msg} -> msg
+          {:error, err} -> raise err
         end
       end
 
       @doc false
       def decode_into(bin, acc, depth) do
-        decode_into_loop(bin, acc, %{}, depth)
+        case decode_into(bin, acc, depth, Wire.default_budget()) do
+          {:ok, msg, _budget} -> {:ok, msg}
+          {:error, _} = err -> err
+        end
       end
 
-      defp decode_into_loop(<<>>, acc, array_chunks, _depth)
+      @doc false
+      def decode_into(bin, acc, depth, budget) do
+        decode_into_loop(bin, acc, %{}, depth, budget)
+      end
+
+      defp decode_into_loop(<<>>, acc, array_chunks, _depth, budget)
            when map_size(array_chunks) == 0 do
-        {:ok, acc}
+        {:ok, acc, budget}
       end
 
-      defp decode_into_loop(<<>>, acc, array_chunks, _depth) do
+      defp decode_into_loop(<<>>, acc, array_chunks, _depth, budget) do
         acc =
           Enum.reduce(array_chunks, acc, fn {name, rev_chunks}, struct_acc ->
             existing = Map.fetch!(struct_acc, name)
@@ -208,19 +281,22 @@ defmodule OmniBuf.Schema do
             Map.put(struct_acc, name, merged)
           end)
 
-        {:ok, acc}
+        {:ok, acc, budget}
       end
 
-      defp decode_into_loop(bin, acc, array_chunks, depth) do
+      defp decode_into_loop(bin, acc, array_chunks, depth, budget) do
         case Wire.decode_tag(bin) do
           {:ok, 0, 12, rest} ->
-            case SchemaMeta.decode_field(rest, depth) do
-              {:ok, _meta, tail} -> decode_into_loop(tail, acc, array_chunks, depth)
-              {:error, _} = err -> err
+            case SchemaMeta.decode_field(rest, depth, budget) do
+              {:ok, _meta, tail, new_budget} ->
+                decode_into_loop(tail, acc, array_chunks, depth, new_budget)
+
+              {:error, _} = err ->
+                err
             end
 
           {:ok, field_num, wt, rest} ->
-            decode_field(field_num, wt, rest, acc, array_chunks, depth)
+            decode_field(field_num, wt, rest, acc, array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -229,9 +305,9 @@ defmodule OmniBuf.Schema do
 
       unquote_splicing(decode_clauses)
 
-      defp decode_field(_field_num, wt, rest, acc, array_chunks, depth) do
-        case Wire.skip_validated(wt, rest, depth) do
-          {:ok, tail} -> decode_into_loop(tail, acc, array_chunks, depth)
+      defp decode_field(_field_num, wt, rest, acc, array_chunks, depth, budget) do
+        case Wire.skip_validated_with_budget(wt, rest, depth, budget) do
+          {:ok, tail, new_budget} -> decode_into_loop(tail, acc, array_chunks, depth, new_budget)
           {:error, _} = err -> err
         end
       end
@@ -524,26 +600,27 @@ defmodule OmniBuf.Schema do
 
   defp gen_decode_clause(%{number: num, name: name, type: :bool}) do
     quote do
-      defp decode_field(unquote(num), 2, rest, acc, array_chunks, depth) do
-        decode_into_loop(rest, Map.put(acc, unquote(name), false), array_chunks, depth)
+      defp decode_field(unquote(num), 2, rest, acc, array_chunks, depth, budget) do
+        decode_into_loop(rest, Map.put(acc, unquote(name), false), array_chunks, depth, budget)
       end
 
-      defp decode_field(unquote(num), 3, rest, acc, array_chunks, depth) do
-        decode_into_loop(rest, Map.put(acc, unquote(name), true), array_chunks, depth)
+      defp decode_field(unquote(num), 3, rest, acc, array_chunks, depth, budget) do
+        decode_into_loop(rest, Map.put(acc, unquote(name), true), array_chunks, depth, budget)
       end
     end
   end
 
   defp gen_decode_clause(%{number: num, name: name, type: :uint32}) do
     quote do
-      defp decode_field(unquote(num), 0, rest, acc, array_chunks, depth) do
+      defp decode_field(unquote(num), 0, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_varint(rest) do
           {:ok, v, tail} ->
             decode_into_loop(
               tail,
               Map.put(acc, unquote(name), Wire.narrow_uint32(v)),
               array_chunks,
-              depth
+              depth,
+              budget
             )
 
           {:error, _} = err ->
@@ -555,10 +632,10 @@ defmodule OmniBuf.Schema do
 
   defp gen_decode_clause(%{number: num, name: name, type: :uint64}) do
     quote do
-      defp decode_field(unquote(num), 0, rest, acc, array_chunks, depth) do
+      defp decode_field(unquote(num), 0, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_varint(rest) do
           {:ok, v, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth)
+            decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -570,14 +647,15 @@ defmodule OmniBuf.Schema do
   defp gen_decode_clause(%{number: num, name: name, type: t})
        when t in [:int32, :sint32, :enum] do
     quote do
-      defp decode_field(unquote(num), 1, rest, acc, array_chunks, depth) do
+      defp decode_field(unquote(num), 1, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_varint(rest) do
           {:ok, u, tail} ->
             decode_into_loop(
               tail,
               Map.put(acc, unquote(name), Wire.narrow_int32(Wire.decode_zigzag(u))),
               array_chunks,
-              depth
+              depth,
+              budget
             )
 
           {:error, _} = err ->
@@ -593,14 +671,15 @@ defmodule OmniBuf.Schema do
 
   defp gen_decode_clause(%{number: num, name: name, type: t}) when t in [:int64, :sint64] do
     quote do
-      defp decode_field(unquote(num), 1, rest, acc, array_chunks, depth) do
+      defp decode_field(unquote(num), 1, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_varint(rest) do
           {:ok, u, tail} ->
             decode_into_loop(
               tail,
               Map.put(acc, unquote(name), Wire.decode_zigzag(u)),
               array_chunks,
-              depth
+              depth,
+              budget
             )
 
           {:error, _} = err ->
@@ -618,12 +697,13 @@ defmodule OmniBuf.Schema do
              <<v::little-unsigned-32, tail::binary>>,
              acc,
              array_chunks,
-             depth
+             depth,
+             budget
            ) do
-        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth)
+        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth, budget)
       end
 
-      defp decode_field(unquote(num), 4, _rest, _acc, _array_chunks, _depth) do
+      defp decode_field(unquote(num), 4, _rest, _acc, _array_chunks, _depth, _budget) do
         OmniBuf.Error.parse(:truncated_fixed32, "truncated fixed32")
       end
     end
@@ -637,12 +717,13 @@ defmodule OmniBuf.Schema do
              <<v::little-unsigned-64, tail::binary>>,
              acc,
              array_chunks,
-             depth
+             depth,
+             budget
            ) do
-        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth)
+        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth, budget)
       end
 
-      defp decode_field(unquote(num), 5, _rest, _acc, _array_chunks, _depth) do
+      defp decode_field(unquote(num), 5, _rest, _acc, _array_chunks, _depth, _budget) do
         OmniBuf.Error.parse(:truncated_fixed64, "truncated fixed64")
       end
     end
@@ -656,12 +737,13 @@ defmodule OmniBuf.Schema do
              <<v::little-signed-32, tail::binary>>,
              acc,
              array_chunks,
-             depth
+             depth,
+             budget
            ) do
-        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth)
+        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth, budget)
       end
 
-      defp decode_field(unquote(num), 6, _rest, _acc, _array_chunks, _depth) do
+      defp decode_field(unquote(num), 6, _rest, _acc, _array_chunks, _depth, _budget) do
         OmniBuf.Error.parse(:truncated_sfixed32, "truncated sfixed32")
       end
     end
@@ -675,12 +757,13 @@ defmodule OmniBuf.Schema do
              <<v::little-signed-64, tail::binary>>,
              acc,
              array_chunks,
-             depth
+             depth,
+             budget
            ) do
-        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth)
+        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth, budget)
       end
 
-      defp decode_field(unquote(num), 7, _rest, _acc, _array_chunks, _depth) do
+      defp decode_field(unquote(num), 7, _rest, _acc, _array_chunks, _depth, _budget) do
         OmniBuf.Error.parse(:truncated_sfixed64, "truncated sfixed64")
       end
     end
@@ -688,10 +771,10 @@ defmodule OmniBuf.Schema do
 
   defp gen_decode_clause(%{number: num, name: name, type: :float}) do
     quote do
-      defp decode_field(unquote(num), 8, rest, acc, array_chunks, depth) do
+      defp decode_field(unquote(num), 8, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_float32(rest) do
           {:ok, f, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), f), array_chunks, depth)
+            decode_into_loop(tail, Map.put(acc, unquote(name), f), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -702,10 +785,10 @@ defmodule OmniBuf.Schema do
 
   defp gen_decode_clause(%{number: num, name: name, type: :double}) do
     quote do
-      defp decode_field(unquote(num), 9, rest, acc, array_chunks, depth) do
+      defp decode_field(unquote(num), 9, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_float64(rest) do
           {:ok, f, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), f), array_chunks, depth)
+            decode_into_loop(tail, Map.put(acc, unquote(name), f), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -716,10 +799,10 @@ defmodule OmniBuf.Schema do
 
   defp gen_decode_clause(%{number: num, name: name, type: :string}) do
     quote do
-      defp decode_field(unquote(num), 10, rest, acc, array_chunks, depth) do
+      defp decode_field(unquote(num), 10, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_string(rest) do
           {:ok, s, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), s), array_chunks, depth)
+            decode_into_loop(tail, Map.put(acc, unquote(name), s), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -730,10 +813,10 @@ defmodule OmniBuf.Schema do
 
   defp gen_decode_clause(%{number: num, name: name, type: :bytes}) do
     quote do
-      defp decode_field(unquote(num), 11, rest, acc, array_chunks, depth) do
+      defp decode_field(unquote(num), 11, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_length_prefixed(rest) do
           {:ok, b, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), b), array_chunks, depth)
+            decode_into_loop(tail, Map.put(acc, unquote(name), b), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -744,12 +827,18 @@ defmodule OmniBuf.Schema do
 
   defp gen_decode_clause(%{number: num, name: name, type: {:message, mod}}) do
     quote do
-      defp decode_field(unquote(num), 12, rest, acc, array_chunks, depth) do
+      defp decode_field(unquote(num), 12, rest, acc, array_chunks, depth, budget) do
         existing = Map.fetch!(acc, unquote(name))
 
-        case Codec.decode_submsg(unquote(mod), rest, existing, depth) do
-          {:ok, sub, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), sub), array_chunks, depth)
+        case Codec.decode_submsg(unquote(mod), rest, existing, depth, budget) do
+          {:ok, sub, tail, new_budget} ->
+            decode_into_loop(
+              tail,
+              Map.put(acc, unquote(name), sub),
+              array_chunks,
+              depth,
+              new_budget
+            )
 
           {:error, _} = err ->
             err
@@ -760,11 +849,11 @@ defmodule OmniBuf.Schema do
 
   defp gen_decode_clause(%{number: num, name: name, type: {:array, elem_type}}) do
     quote do
-      defp decode_field(unquote(num), 13, rest, acc, array_chunks, depth) do
-        case Codec.decode_array(rest, unquote(Macro.escape(elem_type)), depth) do
-          {:ok, items, tail} ->
+      defp decode_field(unquote(num), 13, rest, acc, array_chunks, depth, budget) do
+        case Codec.decode_array(rest, unquote(Macro.escape(elem_type)), depth, budget) do
+          {:ok, items, tail, new_budget} ->
             array_chunks = Map.update(array_chunks, unquote(name), [items], &[items | &1])
-            decode_into_loop(tail, acc, array_chunks, depth)
+            decode_into_loop(tail, acc, array_chunks, depth, new_budget)
 
           {:error, _} = err ->
             err
@@ -775,7 +864,7 @@ defmodule OmniBuf.Schema do
 
   defp gen_decode_clause(%{number: num, name: name, type: {:map, kt, vt}}) do
     quote do
-      defp decode_field(unquote(num), 14, rest, acc, array_chunks, depth) do
+      defp decode_field(unquote(num), 14, rest, acc, array_chunks, depth, budget) do
         existing = Map.fetch!(acc, unquote(name))
 
         case Codec.decode_map(
@@ -783,10 +872,17 @@ defmodule OmniBuf.Schema do
                unquote(Macro.escape(kt)),
                unquote(Macro.escape(vt)),
                existing,
-               depth
+               depth,
+               budget
              ) do
-          {:ok, map, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), map), array_chunks, depth)
+          {:ok, map, tail, new_budget} ->
+            decode_into_loop(
+              tail,
+              Map.put(acc, unquote(name), map),
+              array_chunks,
+              depth,
+              new_budget
+            )
 
           {:error, _} = err ->
             err

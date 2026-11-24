@@ -33,17 +33,39 @@ defmodule OmniBuf do
   @doc """
   Decodes an OmniBuf binary into a fresh struct of `mod` (replace mode).
   """
-  @spec decode(binary(), module()) :: {:ok, struct()} | {:error, Error.t()}
-  def decode(bin, mod) when is_binary(bin) and is_atom(mod) do
-    mod.decode(bin)
+  @spec decode(binary(), module(), keyword()) :: {:ok, struct()} | {:error, Error.t()}
+  def decode(bin, mod, opts \\ []) when is_binary(bin) and is_atom(mod) do
+    mod.decode(bin, opts)
+  end
+
+  @doc """
+  Decodes an OmniBuf binary into a fresh struct of `mod`, raising `OmniBuf.Error` on failure.
+  """
+  @spec decode!(binary(), module(), keyword()) :: struct()
+  def decode!(bin, mod, opts \\ []) when is_binary(bin) and is_atom(mod) do
+    case decode(bin, mod, opts) do
+      {:ok, msg} -> msg
+      {:error, err} -> raise err
+    end
   end
 
   @doc """
   Merges an OmniBuf binary onto an existing struct (merge mode).
   """
-  @spec merge(struct(), binary()) :: {:ok, struct()} | {:error, Error.t()}
-  def merge(%mod{} = existing, bin) when is_binary(bin) do
-    mod.merge(existing, bin)
+  @spec merge(struct(), binary(), keyword()) :: {:ok, struct()} | {:error, Error.t()}
+  def merge(%mod{} = existing, bin, opts \\ []) when is_binary(bin) do
+    mod.merge(existing, bin, opts)
+  end
+
+  @doc """
+  Merges an OmniBuf binary onto an existing struct, raising `OmniBuf.Error` on failure.
+  """
+  @spec merge!(struct(), binary(), keyword()) :: struct()
+  def merge!(%mod{} = existing, bin, opts \\ []) when is_binary(bin) do
+    case mod.merge(existing, bin, opts) do
+      {:ok, msg} -> msg
+      {:error, err} -> raise err
+    end
   end
 
   @doc """
@@ -55,11 +77,28 @@ defmodule OmniBuf do
   end
 
   @doc """
+  Decodes an OmniBuf binary without a schema (Tier 4), raising `OmniBuf.Error` on failure.
+  """
+  @spec decode_blind!(binary(), keyword()) :: map()
+  def decode_blind!(bin, opts \\ []) do
+    Blind.decode!(bin, opts)
+  end
+
+  @doc """
   Decodes an OmniBuf binary without a schema and serializes to JSON (Tier 4).
   """
   @spec decode_blind_json(binary(), keyword()) :: {:ok, String.t()} | {:error, Error.t()}
   def decode_blind_json(bin, opts \\ []) do
     Blind.decode_json(bin, opts)
+  end
+
+  @doc """
+  Decodes an OmniBuf binary without a schema and serializes to JSON (Tier 4),
+  raising `OmniBuf.Error` on failure.
+  """
+  @spec decode_blind_json!(binary(), keyword()) :: String.t()
+  def decode_blind_json!(bin, opts \\ []) do
+    Blind.decode_json!(bin, opts)
   end
 
   @doc """
@@ -73,8 +112,20 @@ defmodule OmniBuf do
   @doc """
   Decodes OmniBuf wire bytes into a standard `elixir-protobuf` struct (Tier 2).
   """
-  @spec decode_proto(binary(), module()) :: {:ok, struct()} | {:error, Error.t()}
-  def decode_proto(bin, mod) do
-    Protobuf.decode(bin, mod)
+  @spec decode_proto(binary(), module(), keyword()) :: {:ok, struct()} | {:error, Error.t()}
+  def decode_proto(bin, mod, opts \\ []) do
+    Protobuf.decode(bin, mod, opts)
+  end
+
+  @doc """
+  Decodes OmniBuf wire bytes into a standard `elixir-protobuf` struct (Tier 2),
+  raising `OmniBuf.Error` on failure.
+  """
+  @spec decode_proto!(binary(), module(), keyword()) :: struct()
+  def decode_proto!(bin, mod, opts \\ []) do
+    case decode_proto(bin, mod, opts) do
+      {:ok, msg} -> msg
+      {:error, err} -> raise err
+    end
   end
 end

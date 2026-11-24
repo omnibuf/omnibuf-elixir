@@ -100,11 +100,14 @@ defmodule OmniBuf.Opaque do
           {:ok, binary()} | {:error, Error.t()}
   def splice(packet, dirty) when is_binary(packet) and is_map(dirty) do
     cond do
-      map_size(dirty) == 0 ->
-        {:ok, packet}
-
       Native.enabled?() ->
         Native.opaque_splice(packet, dirty)
+
+      map_size(dirty) == 0 ->
+        case validate_framing(packet) do
+          :ok -> {:ok, packet}
+          {:error, _} = err -> err
+        end
 
       true ->
         total = byte_size(packet)
@@ -122,6 +125,15 @@ defmodule OmniBuf.Opaque do
           {:error, _} = err ->
             err
         end
+    end
+  end
+
+  defp validate_framing(<<>>), do: :ok
+
+  defp validate_framing(bin) do
+    with {:ok, _field_num, wt, rest} <- Wire.decode_tag(bin),
+         {:ok, next} <- Wire.skip_fast(wt, rest) do
+      validate_framing(next)
     end
   end
 

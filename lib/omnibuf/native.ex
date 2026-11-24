@@ -84,7 +84,12 @@ defmodule OmniBuf.Native do
   @spec encode_struct(module(), struct()) :: binary()
   def encode_struct(mod, msg) do
     {schema, _has_custom_defaults?} = compiled_schema(mod)
-    NIF.nif_encode_struct(schema, msg)
+
+    if :erlang.external_size(msg) >= @dirty_threshold do
+      NIF.nif_encode_struct_dirty(schema, msg)
+    else
+      NIF.nif_encode_struct(schema, msg)
+    end
   end
 
   @doc false

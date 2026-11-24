@@ -129,9 +129,10 @@ defmodule OmniBuf.SchemaMeta do
     with {:ok, field_num, wt, rest} <- Wire.decode_tag(bin) do
       case {field_num, wt} do
         {0, 12} ->
-          with {:ok, _nested_meta, tail, new_budget} <- decode_field(rest, depth, budget) do
-            decode_body_with_budget(tail, depth, acc, new_budget)
-          end
+          Error.parse(
+            :invalid_field_zero,
+            "nested Field #0 (SchemaMeta) is not allowed inside SchemaMeta"
+          )
 
         {1, 10} ->
           with {:ok, name, tail} <- Wire.decode_string(rest) do

@@ -65,6 +65,17 @@ defmodule OmniBuf.Blind do
   defp unwrap_public(v), do: v
 
   @doc """
+  Decodes an OmniBuf binary without a schema, raising `OmniBuf.Error` on failure.
+  """
+  @spec decode!(binary(), keyword()) :: map()
+  def decode!(bin, opts \\ []) when is_binary(bin) do
+    case decode(bin, opts) do
+      {:ok, map} -> map
+      {:error, err} -> raise err
+    end
+  end
+
+  @doc """
   Decodes an OmniBuf binary without a schema and encodes the result as a JSON string.
   `WireBytes` values are encoded as standard RFC 4648 Base64 strings.
   """
@@ -83,6 +94,18 @@ defmodule OmniBuf.Blind do
           {:error, err} -> {:error, Error.new(:serialize, Exception.message(err))}
         end
       end
+    end
+  end
+
+  @doc """
+  Decodes an OmniBuf binary without a schema and encodes the result as a JSON string,
+  raising `OmniBuf.Error` on failure.
+  """
+  @spec decode_json!(binary(), keyword()) :: String.t()
+  def decode_json!(bin, opts \\ []) when is_binary(bin) do
+    case decode_json(bin, opts) do
+      {:ok, json} -> json
+      {:error, err} -> raise err
     end
   end
 
@@ -124,12 +147,19 @@ defmodule OmniBuf.Blind do
   end
 
   defp to_json_value(map) when is_map(map) do
-    Enum.reduce_while(map, {:ok, %{}}, fn {k, v}, {:ok, acc} ->
+    map
+    |> Enum.map(fn {k, v} -> {to_string(k), v} end)
+    |> Enum.sort_by(fn {k, _v} -> k end)
+    |> Enum.reduce_while({:ok, []}, fn {k, v}, {:ok, acc} ->
       case to_json_value(v) do
-        {:ok, jv} -> {:cont, {:ok, Map.put(acc, to_string(k), jv)}}
+        {:ok, jv} -> {:cont, {:ok, [{k, jv} | acc]}}
         err -> {:halt, err}
       end
     end)
+    |> case do
+      {:ok, rev} -> {:ok, Jason.OrderedObject.new(Enum.reverse(rev))}
+      err -> err
+    end
   end
 
   defp to_json_value(v), do: {:ok, v}

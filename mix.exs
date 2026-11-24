@@ -1,7 +1,7 @@
 defmodule OmniBuf.MixProject do
   use Mix.Project
 
-  @version "0.1.2"
+  @version "0.1.3"
   @source_url "https://github.com/omnibuf/omnibuf-elixir"
 
   def project do
@@ -67,7 +67,8 @@ defmodule OmniBuf.MixProject do
       name: "omnibuf",
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib mix.exs README.md LICENSE .formatter.exs)
+      files:
+        ~w(lib native/omnibuf_nif/Cargo.toml native/omnibuf_nif/src mix.exs README.md LICENSE .formatter.exs)
     ]
   end
 

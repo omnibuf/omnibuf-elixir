@@ -488,6 +488,32 @@ fn opaque_splice_impl<'a>(env: Env<'a>, packet: Binary<'a>, dirty_list: Term<'a>
     }
 
     if entries.is_empty() {
+        let n = raw.len();
+        let mut pos = 0usize;
+        while pos < n {
+            let Some((fnum, wt, after_tag)) = read_tag_at(raw, pos) else {
+                return err_tuple(
+                    env,
+                    DecodeErr::new(atoms::parse_error(), format!("invalid tag at {pos}")),
+                );
+            };
+            if fnum == 0 && wt != WIRE_SUB_MSG {
+                return err_tuple(
+                    env,
+                    DecodeErr::new(atoms::invalid_field_zero(), "Field #0 must be WireSubMsg"),
+                );
+            }
+            let Some(field_end) = skip_value_opt(raw, after_tag, wt) else {
+                return err_tuple(
+                    env,
+                    DecodeErr::new(
+                        atoms::parse_error(),
+                        format!("truncated value at {after_tag}"),
+                    ),
+                );
+            };
+            pos = field_end;
+        }
         return (atoms::ok(), packet).encode(env);
     }
 
@@ -654,8 +680,7 @@ fn nif_compile_schema<'a>(msg_list: Term<'a>) -> NifResult<ResourceArc<CompiledS
     Ok(ResourceArc::new(compiled))
 }
 
-#[rustler::nif]
-fn nif_encode_struct<'a>(
+fn encode_struct_impl<'a>(
     env: Env<'a>,
     schema: ResourceArc<CompiledSchema>,
     msg: Term<'a>,
@@ -671,6 +696,24 @@ fn nif_encode_struct<'a>(
         }
         out
     })
+}
+
+#[rustler::nif]
+fn nif_encode_struct<'a>(
+    env: Env<'a>,
+    schema: ResourceArc<CompiledSchema>,
+    msg: Term<'a>,
+) -> NifResult<Term<'a>> {
+    encode_struct_impl(env, schema, msg)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn nif_encode_struct_dirty<'a>(
+    env: Env<'a>,
+    schema: ResourceArc<CompiledSchema>,
+    msg: Term<'a>,
+) -> NifResult<Term<'a>> {
+    encode_struct_impl(env, schema, msg)
 }
 
 fn decode_struct_impl<'a>(

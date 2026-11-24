@@ -514,4 +514,125 @@ defmodule OmniBuf.AuditRegressionTest do
       end
     end
   end
+
+  describe "11. Cumulative DecodeBudget, integer bounds, spec & ergonomics" do
+    test "pure Elixir Schema, Protobuf, and Wire.skip_validated enforce cumulative budget & options" do
+      # 4 chunks of 3 uint32 elements = 12 elements total (> max_elements: 10)
+      tag = Wire.encode_tag(8, 13)
+
+      chunked =
+        1..4
+        |> Enum.map(fn _ ->
+          body = IO.iodata_to_binary([<<0>>, Wire.encode_varint(3), <<3, 5, 7>>])
+          [tag, Wire.encode_varint(byte_size(body)), body]
+        end)
+        |> IO.iodata_to_binary()
+
+      :ok = Native.set_enabled(false)
+
+      assert {:error, %Error{reason: :element_limit_exceeded}} =
+               PeerUpdate.decode(chunked, max_elements: 10)
+
+      assert {:ok, %PeerUpdate{prefixes: [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3]}} =
+               PeerUpdate.decode(chunked, max_elements: 12)
+
+      assert {:error, %Error{reason: :message_too_large}} =
+               PeerUpdate.decode(chunked, max_message_bytes: byte_size(chunked) - 1)
+
+      assert {:error, %Error{reason: :element_limit_exceeded}} =
+               Protobuf.decode(chunked, PB.PeerUpdate, max_elements: 10)
+
+      assert {:error, %Error{reason: :message_too_large}} =
+               Protobuf.decode(chunked, PB.PeerUpdate, max_message_bytes: byte_size(chunked) - 1)
+
+      assert {:error, %Error{reason: :max_depth_exceeded}} =
+               PeerUpdate.decode(
+                 PeerUpdate.encode(%PeerUpdate{
+                   neighbors: [%Omnibuf.Bench.Neighbor{peer_asn: 1}]
+                 }),
+                 max_depth: 1
+               )
+
+      assert {:error, %Error{reason: :element_limit_exceeded}} =
+               Wire.skip_validated(
+                 13,
+                 IO.iodata_to_binary([Wire.encode_varint(5), <<0>>, Wire.encode_varint(3), <<3, 5, 7>>]),
+                 0,
+                 max_elements: 2
+               )
+    end
+
+    test "Wire.encode_varint/1 and encode_zigzag/1 validate 64-bit bounds" do
+      assert is_binary(Wire.encode_varint(0))
+      assert is_binary(Wire.encode_varint(0xFFFF_FFFF_FFFF_FFFF))
+      assert_raise ArgumentError, fn -> Wire.encode_varint(-1) end
+      assert_raise ArgumentError, fn -> Wire.encode_varint(0x1_0000_0000_0000_0000) end
+
+      assert Wire.encode_zigzag(9_223_372_036_854_775_807) == 0xFFFF_FFFF_FFFF_FFFE
+      assert Wire.encode_zigzag(-9_223_372_036_854_775_808) == 0xFFFF_FFFF_FFFF_FFFF
+      assert_raise ArgumentError, fn -> Wire.encode_zigzag(9_223_372_036_854_775_808) end
+      assert_raise ArgumentError, fn -> Wire.encode_zigzag(-9_223_372_036_854_775_809) end
+    end
+
+    test "pure-Elixir Blind.decode_json/2 sorts maps with > 32 keys in unsigned UTF-8 byte order" do
+      :ok = Native.set_enabled(false)
+
+      # Build a packet with 45 fields (> 32 so BEAM uses HAMT map representation)
+      pkt =
+        45..1//-1
+        |> Enum.map(fn i ->
+          [Wire.encode_tag(i, 0), Wire.encode_varint(i)]
+        end)
+        |> IO.iodata_to_binary()
+
+      {:ok, json} = Blind.decode_json(pkt)
+      keys = Regex.scan(~r/"(field_\d+)":/, json) |> Enum.map(fn [_, k] -> k end)
+      assert length(keys) == 45
+      assert keys == Enum.sort(keys)
+    end
+
+    test "rejects nested Field #0 inside SchemaMeta" do
+      inner = IO.iodata_to_binary(SchemaMeta.encode_field(%SchemaMeta{type_name: "Inner"}))
+      outer = IO.iodata_to_binary([<<0x19>>, Wire.encode_length_prefixed(inner)])
+
+      :ok = Native.set_enabled(false)
+      assert {:error, %Error{reason: :invalid_field_zero}} = Blind.decode(outer)
+      assert {:error, %Error{reason: :invalid_field_zero}} = PeerUpdate.decode(outer)
+    end
+
+    test "Opaque.splice/2 validates packet even when dirty map is empty" do
+      bad_pkt = <<0x08, 0x00>>
+
+      for native? <- if(Native.loaded?(), do: [false, true], else: [false]) do
+        :ok = Native.set_enabled(native?)
+        assert {:error, %Error{}} = Opaque.splice(bad_pkt, %{})
+      end
+    end
+
+    test "bang variants return decoded value or raise OmniBuf.Error" do
+      msg = %PeerUpdate{asn: 42, router_id: "rtr-1", active: true}
+      pkt = OmniBuf.encode(msg, self_describing: true)
+
+      assert ^msg = PeerUpdate.decode!(pkt)
+      assert ^msg = OmniBuf.decode!(pkt, PeerUpdate)
+      assert %{"asn" => 42, "router_id" => "rtr-1", "active" => true} = OmniBuf.decode_blind!(pkt)
+      assert is_binary(OmniBuf.decode_blind_json!(pkt))
+
+      assert_raise Error, fn -> PeerUpdate.decode!(<<0x08, 0x00>>) end
+      assert_raise Error, fn -> OmniBuf.decode_blind!(<<0x08, 0x00>>) end
+      assert_raise Error, fn -> OmniBuf.decode_blind_json!(<<0x08, 0x00>>) end
+    end
+
+    test "large struct encode uses dirty-CPU NIF cleanly" do
+      if Native.loaded?() do
+        big = %PeerUpdate{asn: 7, router_id: String.duplicate("a", 40_000), active: true}
+        :ok = Native.set_enabled(false)
+        elx_bin = PeerUpdate.encode(big)
+
+        :ok = Native.set_enabled(true)
+        nif_bin = PeerUpdate.encode(big)
+        assert nif_bin == elx_bin
+      end
+    end
+  end
 end

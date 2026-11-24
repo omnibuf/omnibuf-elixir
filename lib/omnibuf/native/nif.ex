@@ -28,7 +28,8 @@ defmodule OmniBuf.Native.NIF do
   defp try_load_nif do
     candidate_paths()
     |> Enum.any?(fn path ->
-      if File.exists?(path <> ".so") or File.exists?(path <> ".dylib") do
+      if File.exists?(path <> ".so") or File.exists?(path <> ".dylib") or
+           File.exists?(path <> ".dll") do
         case :erlang.load_nif(String.to_charlist(path), 0) do
           :ok -> true
           {:error, {:reload, _}} -> true
@@ -43,9 +44,19 @@ defmodule OmniBuf.Native.NIF do
   defp candidate_paths do
     env_path =
       case System.get_env("OMNIBUF_NIF_PATH") do
-        nil -> []
-        "" -> []
-        p -> [String.replace_suffix(p, ".so", "")]
+        nil ->
+          []
+
+        "" ->
+          []
+
+        p ->
+          [
+            p
+            |> String.replace_suffix(".so", "")
+            |> String.replace_suffix(".dylib", "")
+            |> String.replace_suffix(".dll", "")
+          ]
       end
 
     priv_path =
@@ -95,6 +106,9 @@ defmodule OmniBuf.Native.NIF do
     do: :erlang.nif_error(:nif_not_loaded)
 
   def nif_encode_struct(_schema, _msg),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_encode_struct_dirty(_schema, _msg),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def nif_decode_struct(_schema, _bin),
