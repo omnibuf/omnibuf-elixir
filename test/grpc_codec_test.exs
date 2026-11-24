@@ -124,7 +124,6 @@ defmodule OmniBuf.GRPC.CodecTest do
 
   describe "grpc-elixir loopback integration" do
     setup do
-      start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: GRPC.Client.Supervisor})
       {:ok, _pid, port} = GRPC.Server.start_endpoint(PingEndpoint, 0)
 
       on_exit(fn ->

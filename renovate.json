@@ -2,12 +2,5 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "github>omnibuf/.github"
-  ],
-  "packageRules": [
-    {
-      "description": "Pin test-only grpc dependency to 0.9.x until test suite migrates to grpc 1.x",
-      "matchPackageNames": ["grpc"],
-      "allowedVersions": "<1.0.0"
-    }
   ]
 }
