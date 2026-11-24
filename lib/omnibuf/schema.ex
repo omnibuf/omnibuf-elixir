@@ -210,7 +210,8 @@ defmodule OmniBuf.Schema do
       @doc """
       Merges an OmniBuf binary onto an existing `%#{inspect(__MODULE__)}{}` struct (merge mode).
       """
-      def merge(%__MODULE__{} = existing, bin, opts \\ []) when is_binary(bin) and is_list(opts) do
+      def merge(%__MODULE__{} = existing, bin, opts \\ [])
+          when is_binary(bin) and is_list(opts) do
         if opts == [] and OmniBuf.Native.enabled?() do
           if byte_size(bin) > Wire.default_max_message_bytes() do
             OmniBuf.Error.parse(
@@ -241,7 +242,8 @@ defmodule OmniBuf.Schema do
       Merges an OmniBuf binary onto an existing `%#{inspect(__MODULE__)}{}` struct,
       raising `OmniBuf.Error` on failure.
       """
-      def merge!(%__MODULE__{} = existing, bin, opts \\ []) when is_binary(bin) and is_list(opts) do
+      def merge!(%__MODULE__{} = existing, bin, opts \\ [])
+          when is_binary(bin) and is_list(opts) do
         case merge(existing, bin, opts) do
           {:ok, msg} -> msg
           {:error, err} -> raise err

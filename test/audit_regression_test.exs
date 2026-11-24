@@ -556,7 +556,12 @@ defmodule OmniBuf.AuditRegressionTest do
       assert {:error, %Error{reason: :element_limit_exceeded}} =
                Wire.skip_validated(
                  13,
-                 IO.iodata_to_binary([Wire.encode_varint(5), <<0>>, Wire.encode_varint(3), <<3, 5, 7>>]),
+                 IO.iodata_to_binary([
+                   Wire.encode_varint(5),
+                   <<0>>,
+                   Wire.encode_varint(3),
+                   <<3, 5, 7>>
+                 ]),
                  0,
                  max_elements: 2
                )

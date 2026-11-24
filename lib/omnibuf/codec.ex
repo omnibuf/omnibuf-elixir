@@ -215,7 +215,8 @@ defmodule OmniBuf.Codec do
     end
   end
 
-  defp decode_array_elems(_type, 0, <<>>, _depth, budget, acc), do: {:ok, Enum.reverse(acc), budget}
+  defp decode_array_elems(_type, 0, <<>>, _depth, budget, acc),
+    do: {:ok, Enum.reverse(acc), budget}
 
   defp decode_array_elems(_type, 0, _trailing, _depth, _budget, _acc),
     do: Error.parse(:trailing_bytes, "trailing bytes in WireArray")
@@ -435,7 +436,8 @@ defmodule OmniBuf.Codec do
       Error.parse(:max_depth_exceeded, "max container depth #{max_depth} exceeded")
     else
       with {:ok, body, tail} <- Wire.decode_length_prefixed(bin),
-           {:ok, msg, new_budget} <- mod.decode_into(body, existing || struct(mod), depth + 1, budget) do
+           {:ok, msg, new_budget} <-
+             mod.decode_into(body, existing || struct(mod), depth + 1, budget) do
         {:ok, msg, tail, new_budget}
       end
     end
