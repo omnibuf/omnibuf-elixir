@@ -39,6 +39,24 @@ wire = MyApp.Location.encode(%MyApp.Location{city: "Frankfurt", rack: 42}, self_
 - **Codegen**: `protoc-gen-omnibuf-elixir` (`mix escript.build`) generates struct codecs and lazy `<Message>.Opaque` views with zero-copy BEAM sub-binary splicing.
 - **Blind decode**: `OmniBuf.decode_blind/1` and `OmniBuf.decode_blind_json/1` inspect packets using `Field #0` names or `field_<N>` fallbacks.
 
+## gRPC Integration
+
+`OmniBuf.GRPC.Codec` (`"omnibuf"`) and `OmniBuf.GRPC.SelfDescribingCodec` (`"x-omnibuf"`) implement the `GRPC.Codec` callbacks with no dependency on `:grpc`:
+
+```elixir
+defmodule MyApp.Endpoint do
+  use GRPC.Endpoint
+
+  run(MyApp.NodeServer)
+end
+
+defmodule MyApp.NodeServer do
+  use GRPC.Server,
+    service: MyApp.NodeService.Service,
+    codecs: [OmniBuf.GRPC.Codec, OmniBuf.GRPC.SelfDescribingCodec]
+end
+```
+
 ## Development
 
 ```bash

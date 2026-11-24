@@ -1,7 +1,7 @@
 defmodule OmniBuf.MixProject do
   use Mix.Project
 
-  @version "0.1.3"
+  @version "0.1.4"
   @source_url "https://github.com/omnibuf/omnibuf-elixir"
 
   def project do
@@ -54,7 +54,8 @@ defmodule OmniBuf.MixProject do
     [
       {:jason, "~> 1.4"},
       {:protobuf, "~> 0.14"},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:grpc, "~> 0.9", only: :test}
     ]
   end
 
