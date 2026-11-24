@@ -59,7 +59,12 @@ jobs:
 
       - name: Run full CI and documentation checks
         run: |
-          just ci
+          just fmt-check
+          just lint
+          just build
+          OMNIBUF_NATIVE=0 mix test --trace
+          OMNIBUF_NATIVE=1 mix test --trace
+          just conformance
           mix docs
           mix hex.build
 
