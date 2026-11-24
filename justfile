@@ -39,10 +39,13 @@ conformance:
 bench:
     OMNIBUF_ESCRIPT=conformance MIX_ENV=prod mix run bench/peer_bench.exs
 
-# Run static compilation checks and buf lint
+# Run static compilation, formatting, Rust NIF, and buf lint checks
 lint:
     mix compile --warnings-as-errors
+    mix format --check-formatted
     buf lint
+    cargo clippy --manifest-path native/omnibuf_nif/Cargo.toml -- -D warnings
+    cargo fmt --manifest-path native/omnibuf_nif/Cargo.toml --check
 
 # Format Elixir and Protobuf files in place
 fmt:

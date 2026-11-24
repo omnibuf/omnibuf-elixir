@@ -141,12 +141,7 @@ defmodule OmniBuf.Plugin.Generator do
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n")
 
-    formatted =
-      try do
-        IO.iodata_to_binary([Code.format_string!(content), "\n"])
-      rescue
-        _ -> content <> "\n"
-      end
+    formatted = IO.iodata_to_binary([Code.format_string!(content), "\n"])
 
     %CodeGeneratorResponse.File{
       name: out_name,

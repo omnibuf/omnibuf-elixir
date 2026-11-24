@@ -3,7 +3,7 @@ defmodule OmniBuf.Blind do
   Tier 4: Schema-less OmniBuf packet decoding (`OmniBuf.Blind.decode/1` and
   `OmniBuf.Blind.decode_json/1`).
 
-  Decodes any OmniBuf v0.1 packet into JSON-ready Elixir maps, resolving Field #0
+  Decodes any OmniBuf v1 DRAFT-1 packet into JSON-ready Elixir maps, resolving Field #0
   (`OmniBuf.SchemaMeta`) names across nested submessages, arrays, and maps, and
   falling back to `"field_<N>"` for unnamed fields.
   """

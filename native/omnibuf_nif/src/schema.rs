@@ -96,7 +96,6 @@ impl ElemKind {
 }
 
 pub struct FieldDesc {
-    pub number: u32,
     pub name_atom: Atom,
     pub tag_bytes: [u8; 9],
     pub tag_len: u8,
@@ -324,7 +323,6 @@ pub fn compile_schema_from_term<'a>(msg_list: Term<'a>) -> NifResult<CompiledSch
 
             struct_keys.push(name_atom);
             fields.push(FieldDesc {
-                number,
                 name_atom,
                 tag_bytes,
                 tag_len,
@@ -916,7 +914,11 @@ pub fn decode_message<'a>(
 
         let field_idx_opt = if (fnum as usize) < 64 {
             let idx = msg_schema.fast_fields[fnum as usize];
-            if idx == u16::MAX { None } else { Some(idx as usize) }
+            if idx == u16::MAX {
+                None
+            } else {
+                Some(idx as usize)
+            }
         } else {
             msg_schema.overflow_fields.get(&fnum).map(|&i| i as usize)
         };
@@ -968,7 +970,9 @@ pub fn decode_message<'a>(
                 let bytes: [u8; 4] = raw
                     .get(pos..pos + 4)
                     .and_then(|s| s.try_into().ok())
-                    .ok_or_else(|| DecodeErr::new(atoms::truncated_fixed32(), "truncated fixed32"))?;
+                    .ok_or_else(|| {
+                        DecodeErr::new(atoms::truncated_fixed32(), "truncated fixed32")
+                    })?;
                 pos += 4;
                 vals[val_slot] = u32::from_le_bytes(bytes).encode(env);
             }
@@ -976,7 +980,9 @@ pub fn decode_message<'a>(
                 let bytes: [u8; 8] = raw
                     .get(pos..pos + 8)
                     .and_then(|s| s.try_into().ok())
-                    .ok_or_else(|| DecodeErr::new(atoms::truncated_fixed64(), "truncated fixed64"))?;
+                    .ok_or_else(|| {
+                        DecodeErr::new(atoms::truncated_fixed64(), "truncated fixed64")
+                    })?;
                 pos += 8;
                 vals[val_slot] = u64::from_le_bytes(bytes).encode(env);
             }
@@ -984,7 +990,9 @@ pub fn decode_message<'a>(
                 let bytes: [u8; 4] = raw
                     .get(pos..pos + 4)
                     .and_then(|s| s.try_into().ok())
-                    .ok_or_else(|| DecodeErr::new(atoms::truncated_sfixed32(), "truncated sfixed32"))?;
+                    .ok_or_else(|| {
+                        DecodeErr::new(atoms::truncated_sfixed32(), "truncated sfixed32")
+                    })?;
                 pos += 4;
                 vals[val_slot] = i32::from_le_bytes(bytes).encode(env);
             }
@@ -992,7 +1000,9 @@ pub fn decode_message<'a>(
                 let bytes: [u8; 8] = raw
                     .get(pos..pos + 8)
                     .and_then(|s| s.try_into().ok())
-                    .ok_or_else(|| DecodeErr::new(atoms::truncated_sfixed64(), "truncated sfixed64"))?;
+                    .ok_or_else(|| {
+                        DecodeErr::new(atoms::truncated_sfixed64(), "truncated sfixed64")
+                    })?;
                 pos += 8;
                 vals[val_slot] = i64::from_le_bytes(bytes).encode(env);
             }
@@ -1000,7 +1010,9 @@ pub fn decode_message<'a>(
                 let bytes: [u8; 4] = raw
                     .get(pos..pos + 4)
                     .and_then(|s| s.try_into().ok())
-                    .ok_or_else(|| DecodeErr::new(atoms::truncated_fixed32(), "truncated float32"))?;
+                    .ok_or_else(|| {
+                        DecodeErr::new(atoms::truncated_fixed32(), "truncated float32")
+                    })?;
                 pos += 4;
                 vals[val_slot] = make_f32_term(env, u32::from_le_bytes(bytes));
             }
@@ -1008,19 +1020,19 @@ pub fn decode_message<'a>(
                 let bytes: [u8; 8] = raw
                     .get(pos..pos + 8)
                     .and_then(|s| s.try_into().ok())
-                    .ok_or_else(|| DecodeErr::new(atoms::truncated_fixed64(), "truncated float64"))?;
+                    .ok_or_else(|| {
+                        DecodeErr::new(atoms::truncated_fixed64(), "truncated float64")
+                    })?;
                 pos += 8;
                 vals[val_slot] = make_f64_term(env, u64::from_le_bytes(bytes));
             }
             (ElemKind::String, WIRE_STRING) => {
-                let (s, next_pos) =
-                    read_str_slice(raw, pos).map_err(DecodeErr::from_omnibuf)?;
+                let (s, next_pos) = read_str_slice(raw, pos).map_err(DecodeErr::from_omnibuf)?;
                 pos = next_pos;
                 vals[val_slot] = make_bytes_term(env, s.as_bytes());
             }
             (ElemKind::Bytes, WIRE_BYTES) => {
-                let (b, next_pos) =
-                    read_len_slice(raw, pos, 0).map_err(DecodeErr::from_omnibuf)?;
+                let (b, next_pos) = read_len_slice(raw, pos, 0).map_err(DecodeErr::from_omnibuf)?;
                 pos = next_pos;
                 vals[val_slot] = make_bytes_term(env, b);
             }
@@ -1039,15 +1051,8 @@ pub fn decode_message<'a>(
                 } else {
                     Some(vals[val_slot])
                 };
-                vals[val_slot] = decode_message(
-                    env,
-                    schema,
-                    *sub_idx,
-                    body,
-                    existing_sub,
-                    depth + 1,
-                    budget,
-                )?;
+                vals[val_slot] =
+                    decode_message(env, schema, *sub_idx, body, existing_sub, depth + 1, budget)?;
             }
             (ElemKind::Array(elem_kind), WIRE_ARRAY) => {
                 let (items, next_pos) =
@@ -1077,10 +1082,8 @@ pub fn decode_message<'a>(
                 let (merged_map, next_pos) = decode_map(
                     env,
                     schema,
-                    k_kind,
-                    v_kind,
-                    raw,
-                    pos,
+                    (k_kind, v_kind),
+                    (raw, pos),
                     vals[val_slot],
                     depth,
                     budget,
@@ -1103,7 +1106,11 @@ pub fn decode_message<'a>(
         }
     }
 
-    let keys: Vec<Term<'a>> = msg_schema.struct_keys.iter().map(|a| a.encode(env)).collect();
+    let keys: Vec<Term<'a>> = msg_schema
+        .struct_keys
+        .iter()
+        .map(|a| a.encode(env))
+        .collect();
     Term::map_from_arrays(env, &keys, &vals)
         .map_err(|_| DecodeErr::new(atoms::parse_error(), "failed to construct struct map"))
 }
@@ -1185,14 +1192,11 @@ fn decode_array<'a>(
     Ok((items, next_pos))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn decode_map<'a>(
     env: Env<'a>,
     schema: &CompiledSchema,
-    k_kind: &ElemKind,
-    v_kind: &ElemKind,
-    raw: &[u8],
-    pos: usize,
+    (k_kind, v_kind): (&ElemKind, &ElemKind),
+    (raw, pos): (&[u8], usize),
     mut acc: Term<'a>,
     depth: usize,
     budget: &mut DecodeBudget,
@@ -1204,45 +1208,12 @@ fn decode_map<'a>(
         ));
     }
     let (body, next_pos) = read_len_slice(raw, pos, 3).map_err(DecodeErr::from_omnibuf)?;
-    let actual_kt = body[0];
-    let actual_vt = body[1];
-    let valid_kt = matches!(
-        actual_kt,
-        WIRE_UINT
-            | WIRE_SINT
-            | WIRE_BOOL_FALSE
-            | WIRE_FIXED32
-            | WIRE_FIXED64
-            | WIRE_SFIXED32
-            | WIRE_SFIXED64
-            | WIRE_STRING
-    );
-    if !valid_kt || actual_vt > 15 || actual_vt == WIRE_BOOL_TRUE {
+    let Some((actual_kt, actual_vt, count, hdr_len)) = parse_map_header(body) else {
         return Err(DecodeErr::new(
             atoms::parse_error(),
-            format!("invalid WireMap header <{actual_kt}, {actual_vt}>"),
-        ));
-    }
-    let Some((count_u64, vn)) = decode_varint(&body[2..]) else {
-        return Err(DecodeErr::new(
-            atoms::truncated_varint(),
-            "invalid WireMap count varint",
+            "invalid WireMap header or count exceeds remaining bytes",
         ));
     };
-    let count = usize::try_from(count_u64).map_err(|_| {
-        DecodeErr::new(
-            atoms::element_limit_exceeded(),
-            format!("map entry count {count_u64} overflows usize"),
-        )
-    })?;
-    let hdr_len = 2 + vn;
-    let remaining = body.len() - hdr_len;
-    if count == 0 && remaining != 0 {
-        return Err(DecodeErr::new(
-            atoms::trailing_bytes(),
-            "empty WireMap has trailing bytes",
-        ));
-    }
     let expected_kt = k_kind.wire_type();
     let expected_vt = v_kind.wire_type();
     if actual_kt != expected_kt || actual_vt != expected_vt {
@@ -1253,14 +1224,6 @@ fn decode_map<'a>(
             ),
         ));
     }
-    let Some((_, _, parsed_count, parsed_hdr_len)) = parse_map_header(body) else {
-        return Err(DecodeErr::new(
-            atoms::parse_error(),
-            "invalid WireMap header or count exceeds remaining bytes",
-        ));
-    };
-    debug_assert_eq!(count, parsed_count);
-    debug_assert_eq!(hdr_len, parsed_hdr_len);
 
     budget.add_elements(count)?;
 
@@ -1392,8 +1355,15 @@ fn decode_element<'a>(
         }
         ElemKind::Map(k_kind, v_kind) => {
             let empty_map = Term::map_new(env);
-            let (m, next_pos) =
-                decode_map(env, schema, k_kind, v_kind, raw, pos, empty_map, depth, budget)?;
+            let (m, next_pos) = decode_map(
+                env,
+                schema,
+                (k_kind, v_kind),
+                (raw, pos),
+                empty_map,
+                depth,
+                budget,
+            )?;
             Ok((m, next_pos))
         }
     }

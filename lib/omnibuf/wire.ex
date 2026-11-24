@@ -1,6 +1,6 @@
 defmodule OmniBuf.Wire do
   @moduledoc """
-  Low-level OmniBuf v0.1 wire primitives: 1/2/4/9-byte Prefix-Varints, 64-bit ZigZag,
+  Low-level OmniBuf v1 DRAFT-1 wire primitives: 1/2/4/9-byte Prefix-Varints, 64-bit ZigZag,
   all 16 wire types, IEEE-754 float handling, O(1) sub-binary field skipping, and
   container/depth validation.
   """

@@ -1,6 +1,6 @@
 defmodule OmniBuf.Codec do
   @moduledoc """
-  Shared high-performance OmniBuf v0.1 field encoders and decoders used by
+  Shared high-performance OmniBuf v1 DRAFT-1 field encoders and decoders used by
   generated plugin code (Tier 1), Protobuf integration (Tier 2), and
   declarative `OmniBuf.Schema` structs (Tier 3).
   """

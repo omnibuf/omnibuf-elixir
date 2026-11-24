@@ -1,6 +1,6 @@
 defmodule OmniBuf.Protobuf do
   @moduledoc """
-  Tier 2: Direct OmniBuf v0.1 serialization and deserialization for standard
+  Tier 2: Direct OmniBuf v1 DRAFT-1 serialization and deserialization for standard
   `elixir-protobuf` (`use Protobuf`) message structs using `__message_props__/0`.
   """
 

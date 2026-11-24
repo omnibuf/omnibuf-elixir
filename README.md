@@ -1,12 +1,12 @@
-# OmniBuf for Elixir
+# omnibuf-elixir
 
-Elixir implementation of the [OmniBuf v0.1](https://omnibuf.com/spec) binary wire format.
+[![OmniBuf Spec: v1 DRAFT-1](https://img.shields.io/badge/OmniBuf%20Spec-v1%20DRAFT--1-FF4F18)](https://omnibuf.com/spec)
 
-OmniBuf uses numbered Protobuf fields, 1/2/4/9-byte Prefix-Varints, distinct wire codes for all 16 scalar and container types, single-pass iodata encoding, lazy zero-decode `Opaque` views with in-place iodata wire splicing, and optional Field #0 (`SchemaMeta`) self-describing metadata.
+Elixir 1.17+ (OTP 27+) implementation of the [OmniBuf v1 DRAFT-1 wire specification](https://omnibuf.com/spec). Documentation and benchmarks live at [omnibuf.com/elixir](https://omnibuf.com/elixir).
 
-## Installation
+## Install
 
-Add `omnibuf` to your `mix.exs` dependencies:
+Add `omnibuf` to `mix.exs`:
 
 ```elixir
 def deps do
@@ -16,99 +16,35 @@ def deps do
 end
 ```
 
-Requires Elixir 1.17+ and Erlang/OTP 27+.
-
-## Four Implementation Tiers
-
-### Tier 1: `protoc-gen-omnibuf-elixir` Plugin & Lazy `Opaque` Views
-
-Build the escript plugin and run `buf generate`:
-
-```bash
-mix escript.build
-buf generate
-```
-
-Generated modules provide fast struct codecs and lazy `<Message>.Opaque` views that read nested fields in `O(fields)` time and splice mutations using zero-copy BEAM sub-binaries:
-
-```elixir
-alias Omnibuf.Bench.{Location, PeerUpdate}
-
-# Zero-decode nested field read
-city =
-  packet
-  |> PeerUpdate.Opaque.new()
-  |> PeerUpdate.Opaque.get_location()
-  |> Location.Opaque.get_city()
-
-# Selective in-place wire splice (untouched fields stay raw sub-binaries)
-updated =
-  packet
-  |> PeerUpdate.Opaque.new()
-  |> PeerUpdate.Opaque.set_sequence(9_876_543_211)
-  |> PeerUpdate.Opaque.marshal!()
-```
-
-### Tier 2: `elixir-protobuf` Integration
-
-Encode and decode standard `use Protobuf` structs directly to and from OmniBuf wire bytes:
-
-```elixir
-wire = OmniBuf.encode_proto(pb_struct)
-{:ok, decoded} = OmniBuf.decode_proto(wire, MyApp.PB.PeerUpdate)
-```
-
-### Tier 3: Declarative Struct DSL (`OmniBuf.Schema`)
-
-Define OmniBuf messages directly in Elixir without `.proto` files. Compile-time macros generate specialized iodata encoders and binary pattern-matching decoders:
+## Quick Usage
 
 ```elixir
 defmodule MyApp.Location do
   use OmniBuf.Schema, name: "Location"
 
   field 1, :region, :string
-  field 2, :datacenter, :string
   field 3, :city, :string
   field 4, :rack, :uint32
-  field 5, :latitude, :float
-  field 6, :longitude, :float
 end
 
-wire = MyApp.Location.encode(%MyApp.Location{city: "Frankfurt", rack: 42})
+wire = MyApp.Location.encode(%MyApp.Location{city: "Frankfurt", rack: 42}, self_describing: true)
 {:ok, loc} = MyApp.Location.decode(wire)
 ```
 
-Pass `self_describing: true` to prepend Field #0 `SchemaMeta`:
+## Implementation Details
 
-```elixir
-wire = MyApp.Location.encode(loc, self_describing: true)
-```
+- **`OmniBuf.Schema` macro**: Compile-time DSL that generates iodata encoders and binary pattern-matching decoders directly on Elixir structs.
+- **Optional Rustler NIF**: `native/omnibuf_nif` provides an optional Rustler NIF built on the Rust `omnibuf` crate.
+- **`protobuf` interop**: `OmniBuf.encode_proto/2` and `OmniBuf.decode_proto/2` handle standard `use Protobuf` structs.
+- **Codegen**: `protoc-gen-omnibuf-elixir` (`mix escript.build`) generates struct codecs and lazy `<Message>.Opaque` views with zero-copy BEAM sub-binary splicing.
+- **Blind decode**: `OmniBuf.decode_blind/1` and `OmniBuf.decode_blind_json/1` inspect packets using `Field #0` names or `field_<N>` fallbacks.
 
-### Tier 4: Schema-less Blind Decode (`OmniBuf.Blind`)
-
-Inspect any OmniBuf packet with no compiled schema. Declared Field #0 names propagate through nested messages, arrays, and maps; unnamed fields fall back to `"field_<N>"`.
-
-```elixir
-{:ok, map} = OmniBuf.decode_blind(wire)
-{:ok, json} = OmniBuf.decode_blind_json(wire)
-```
-
-## Benchmarks
-
-Elixir benchmark results, methodology, and cross-language comparisons live at [omnibuf.com/benchmarks?lang=elixir](https://omnibuf.com/benchmarks?lang=elixir) (all languages at [omnibuf.com/benchmarks](https://omnibuf.com/benchmarks)). Run `just bench` locally to regenerate [`testdata/benchmarks.json`](testdata/benchmarks.json).
-
-## Conformance & Development
+## Development
 
 ```bash
-just fmt-check
-just lint
-just test
-just conformance
-just bench
+just test && just conformance
 ```
-
-The conformance suite passes **992 / 992** test cases across all 4 tiers (`TIER_PLUGIN`, `TIER_PROTOBUF_TYPES`, `TIER_ANNOTATED_STRUCT`, `TIER_BLIND`) with 0 failures.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](./LICENSE).

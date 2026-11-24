@@ -1,6 +1,6 @@
 defmodule OmniBuf do
   @moduledoc """
-  OmniBuf v0.1 binary wire format for Elixir.
+  OmniBuf v1 DRAFT-1 binary wire format for Elixir.
 
   Supports all four OmniBuf implementation tiers:
   - **Tier 1 (Plugin):** `protoc-gen-omnibuf-elixir` generated structs, iodata codecs,

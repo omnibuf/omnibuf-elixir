@@ -59,7 +59,7 @@ defmodule OmniBuf.MixProject do
   end
 
   defp description do
-    "OmniBuf v0.1 binary wire format for Elixir: Prefix-Varints, self-describing schemas, lazy Opaque views, and Protobuf compatibility."
+    "OmniBuf v1 DRAFT-1 binary wire format for Elixir: Prefix-Varints, self-describing schemas, lazy Opaque views, and Protobuf compatibility."
   end
 
   defp package do

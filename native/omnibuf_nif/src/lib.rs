@@ -334,7 +334,10 @@ fn nif_opaque_find_last<'a>(
         let Some(next) = skip_value_opt(raw, after_tag, wt) else {
             return err_tuple(
                 env,
-                DecodeErr::new(atoms::parse_error(), format!("truncated value at {after_tag}")),
+                DecodeErr::new(
+                    atoms::parse_error(),
+                    format!("truncated value at {after_tag}"),
+                ),
             );
         };
         pos = next;
@@ -385,7 +388,10 @@ fn nif_opaque_find_all<'a>(
         let Some(next) = skip_value_opt(raw, after_tag, wt) else {
             return err_tuple(
                 env,
-                DecodeErr::new(atoms::parse_error(), format!("truncated value at {after_tag}")),
+                DecodeErr::new(
+                    atoms::parse_error(),
+                    format!("truncated value at {after_tag}"),
+                ),
             );
         };
         pos = next;
@@ -439,7 +445,10 @@ fn nif_opaque_extract_submsg<'a>(env: Env<'a>, bin: Binary<'a>, target_field: u3
             let Some(next) = skip_value_opt(raw, after_tag, wt) else {
                 return err_tuple(
                     env,
-                    DecodeErr::new(atoms::parse_error(), format!("truncated value at {after_tag}")),
+                    DecodeErr::new(
+                        atoms::parse_error(),
+                        format!("truncated value at {after_tag}"),
+                    ),
                 );
             };
             pos = next;
@@ -461,7 +470,10 @@ fn nif_opaque_extract_submsg<'a>(env: Env<'a>, bin: Binary<'a>, target_field: u3
 fn opaque_splice_impl<'a>(env: Env<'a>, packet: Binary<'a>, dirty_list: Term<'a>) -> Term<'a> {
     let raw = packet.as_slice();
     let Ok(iter) = dirty_list.decode::<ListIterator<'a>>() else {
-        return err_tuple(env, DecodeErr::new(atoms::parse_error(), "invalid dirty list"));
+        return err_tuple(
+            env,
+            DecodeErr::new(atoms::parse_error(), "invalid dirty list"),
+        );
     };
 
     let mut entries: Vec<(u32, Binary<'a>)> = Vec::new();
@@ -471,10 +483,16 @@ fn opaque_splice_impl<'a>(env: Env<'a>, packet: Binary<'a>, dirty_list: Term<'a>
 
     for item in iter {
         let Ok((fnum, iodata_term)) = item.decode::<(u32, Term<'a>)>() else {
-            return err_tuple(env, DecodeErr::new(atoms::parse_error(), "invalid dirty entry"));
+            return err_tuple(
+                env,
+                DecodeErr::new(atoms::parse_error(), "invalid dirty entry"),
+            );
         };
         let Ok(bin) = Binary::from_iolist(iodata_term) else {
-            return err_tuple(env, DecodeErr::new(atoms::parse_error(), "invalid dirty iodata"));
+            return err_tuple(
+                env,
+                DecodeErr::new(atoms::parse_error(), "invalid dirty iodata"),
+            );
         };
         if fnum == 0 || fnum >= 64 {
             all_small = false;
@@ -662,11 +680,7 @@ fn nif_opaque_splice<'a>(env: Env<'a>, packet: Binary<'a>, dirty_list: Term<'a>)
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn nif_opaque_splice_dirty<'a>(
-    env: Env<'a>,
-    packet: Binary<'a>,
-    dirty_list: Term<'a>,
-) -> Term<'a> {
+fn nif_opaque_splice_dirty<'a>(env: Env<'a>, packet: Binary<'a>, dirty_list: Term<'a>) -> Term<'a> {
     opaque_splice_impl(env, packet, dirty_list)
 }
 
