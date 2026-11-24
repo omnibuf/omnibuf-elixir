@@ -64,7 +64,8 @@ jobs:
           just build
           OMNIBUF_NATIVE=0 mix test --trace
           OMNIBUF_NATIVE=1 mix test --trace
-          just conformance
+          OMNIBUF_NATIVE=0 just conformance
+          OMNIBUF_NATIVE=1 just conformance
           mix docs
           mix hex.build
 
