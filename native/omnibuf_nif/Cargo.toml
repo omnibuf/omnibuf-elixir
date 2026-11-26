@@ -8,7 +8,7 @@ name = "omnibuf_nif"
 crate-type = ["cdylib"]
 
 [dependencies]
-omnibuf = { version = "0.1.9", default-features = false }
+omnibuf = { version = "0.1.11", default-features = false }
 rustler = "0.39"
 
 [profile.release]

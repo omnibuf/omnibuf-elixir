@@ -87,6 +87,83 @@ defmodule OmniBuf.Opaque do
   defp wt_matches?(wt, target_wt), do: wt == target_wt
 
   @doc """
+  Scans `bin` in O(fields) time and returns the last-winning branch among `branch_specs`,
+  where `branch_specs` maps `field_number => expected_wire_type` (`0..15 | :bool`).
+
+  For `WireSubMsg` (`12`) branches, consecutive occurrences of the winning branch are
+  concatenated into a single submessage body binary so repeated occurrences merge cleanly,
+  while occurrences separated by another sibling branch reset to the later branch.
+
+  Returns `{:ok, {:found, field_num, wire_type, rest_or_body}}`, `{:ok, :not_found}`,
+  or `{:error, err}`.
+  """
+  @spec find_last_oneof(binary(), %{optional(non_neg_integer()) => 0..15 | :bool}) ::
+          {:ok, {:found, non_neg_integer(), 0..15, binary()} | :not_found} | {:error, Error.t()}
+  def find_last_oneof(bin, branch_specs) when is_binary(bin) and is_map(branch_specs) do
+    scan_last_oneof(bin, branch_specs, :not_found)
+  end
+
+  defp scan_last_oneof(<<>>, _branch_specs, :not_found), do: {:ok, :not_found}
+
+  defp scan_last_oneof(<<>>, _branch_specs, {field_num, 12, [single_rest]}) do
+    case Wire.decode_length_prefixed(single_rest) do
+      {:ok, body, _} -> {:ok, {:found, field_num, 12, body}}
+      err -> err
+    end
+  end
+
+  defp scan_last_oneof(<<>>, _branch_specs, {field_num, 12, rev_rests}) do
+    rev_rests
+    |> Enum.reverse()
+    |> Enum.reduce_while({:ok, []}, fn rest, {:ok, acc} ->
+      case Wire.decode_length_prefixed(rest) do
+        {:ok, body, _} -> {:cont, {:ok, [acc, body]}}
+        err -> {:halt, err}
+      end
+    end)
+    |> case do
+      {:ok, iodata} -> {:ok, {:found, field_num, 12, IO.iodata_to_binary(iodata)}}
+      err -> err
+    end
+  end
+
+  defp scan_last_oneof(<<>>, _branch_specs, {field_num, wt, [last_rest | _]}) do
+    {:ok, {:found, field_num, wt, last_rest}}
+  end
+
+  defp scan_last_oneof(bin, branch_specs, acc) do
+    case Wire.decode_tag(bin) do
+      {:ok, field_num, wt, rest} ->
+        acc =
+          case Map.fetch(branch_specs, field_num) do
+            {:ok, expected_wt} ->
+              if wt_matches?(wt, expected_wt) do
+                case acc do
+                  {^field_num, 12, prev_rests} when wt == 12 ->
+                    {field_num, 12, [rest | prev_rests]}
+
+                  _ ->
+                    {field_num, wt, [rest]}
+                end
+              else
+                acc
+              end
+
+            :error ->
+              acc
+          end
+
+        case Wire.skip_fast(wt, rest) do
+          {:ok, next} -> scan_last_oneof(next, branch_specs, acc)
+          {:error, _} = err -> err
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc """
   Splices `dirty` field replacements into `packet` without decoding untouched fields.
 
   `dirty` is a map `%{field_number => encoded_field_iodata}` where `encoded_field_iodata`

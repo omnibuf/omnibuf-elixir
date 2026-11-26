@@ -83,12 +83,16 @@ defmodule OmniBuf.Native do
   @doc false
   @spec encode_struct(module(), struct()) :: binary()
   def encode_struct(mod, msg) do
-    {schema, _has_custom_defaults?} = compiled_schema(mod)
+    case compiled_schema(mod) do
+      :elixir_only ->
+        IO.iodata_to_binary(mod.encode_iodata_elixir(msg))
 
-    if :erlang.external_size(msg) >= @dirty_threshold do
-      NIF.nif_encode_struct_dirty(schema, msg)
-    else
-      NIF.nif_encode_struct(schema, msg)
+      {schema, _has_custom_defaults?} ->
+        if :erlang.external_size(msg) >= @dirty_threshold do
+          NIF.nif_encode_struct_dirty(schema, msg)
+        else
+          NIF.nif_encode_struct(schema, msg)
+        end
     end
   end
 
@@ -96,6 +100,9 @@ defmodule OmniBuf.Native do
   @spec decode_struct(module(), binary()) :: {:ok, struct()} | {:error, Error.t()}
   def decode_struct(mod, bin) do
     case compiled_schema(mod) do
+      :elixir_only ->
+        mod.decode_into(bin, struct(mod), 0)
+
       {_schema, true} ->
         mod.decode_into(bin, struct(mod), 0)
 
@@ -112,6 +119,9 @@ defmodule OmniBuf.Native do
   @spec merge_struct(module(), struct(), binary()) :: {:ok, struct()} | {:error, Error.t()}
   def merge_struct(mod, existing, bin) do
     case compiled_schema(mod) do
+      :elixir_only ->
+        mod.decode_into(bin, existing, 0)
+
       {_schema, true} ->
         mod.decode_into(bin, existing, 0)
 
@@ -129,9 +139,16 @@ defmodule OmniBuf.Native do
 
     case :persistent_term.get(key, nil) do
       nil ->
-        {graph, has_custom_defaults?} = collect_schema_graph(mod)
-        ref = NIF.nif_compile_schema(graph)
-        entry = {ref, has_custom_defaults?}
+        entry =
+          case collect_schema_graph(mod) do
+            :elixir_only ->
+              :elixir_only
+
+            {graph, has_custom_defaults?} ->
+              ref = NIF.nif_compile_schema(graph)
+              {ref, has_custom_defaults?}
+          end
+
         :persistent_term.put(key, entry)
         entry
 
@@ -143,32 +160,56 @@ defmodule OmniBuf.Native do
   defp collect_schema_graph(root_mod) do
     {ordered_mods, index_map} = discover_modules([root_mod], %{root_mod => 0}, [root_mod])
 
-    has_custom_defaults? =
+    elixir_only? =
       Enum.any?(ordered_mods, fn mod ->
-        Enum.any?(mod.__omnibuf_fields__(), fn f ->
-          f.default !== Codec.default_value(f.type)
-        end)
+        mod_oneofs(mod) != [] or
+          Enum.any?(mod.__omnibuf_fields__(), fn f -> Map.get(f, :optional, false) end)
       end)
 
-    graph =
-      Enum.map(ordered_mods, fn mod ->
-        fields =
-          Enum.map(mod.__omnibuf_fields__(), fn f ->
-            {f.number, f.name, encode_kind(f.type, index_map), f.emit_empty}
+    if elixir_only? do
+      :elixir_only
+    else
+      has_custom_defaults? =
+        Enum.any?(ordered_mods, fn mod ->
+          Enum.any?(mod.__omnibuf_fields__(), fn f ->
+            f.default !== Codec.default_value(f.type)
           end)
+        end)
 
-        {mod, fields}
-      end)
+      graph =
+        Enum.map(ordered_mods, fn mod ->
+          fields =
+            Enum.map(mod.__omnibuf_fields__(), fn f ->
+              {f.number, f.name, encode_kind(f.type, index_map), f.emit_empty}
+            end)
 
-    {graph, has_custom_defaults?}
+          {mod, fields}
+        end)
+
+      {graph, has_custom_defaults?}
+    end
+  end
+
+  defp mod_oneofs(mod) do
+    if function_exported?(mod, :__omnibuf_oneofs__, 0) do
+      mod.__omnibuf_oneofs__()
+    else
+      []
+    end
   end
 
   defp discover_modules([], index_map, acc), do: {Enum.reverse(acc), index_map}
 
   defp discover_modules([mod | rest], index_map, acc) do
-    child_mods =
+    field_child_mods =
       mod.__omnibuf_fields__()
       |> Enum.flat_map(fn f -> extract_nested_mods(f.type) end)
+
+    oneof_child_mods =
+      mod_oneofs(mod)
+      |> Enum.flat_map(fn o -> Enum.flat_map(o.branches, &extract_nested_mods(&1.type)) end)
+
+    child_mods = field_child_mods ++ oneof_child_mods
 
     {new_queue, new_map, new_acc} =
       Enum.reduce(child_mods, {rest, index_map, acc}, fn child, {q, m, a} ->

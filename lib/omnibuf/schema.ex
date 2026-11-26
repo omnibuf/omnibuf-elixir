@@ -6,6 +6,9 @@ defmodule OmniBuf.Schema do
   specialized iodata encoders, binary-matching decoders, merge decoders, and
   `SchemaMeta` builders with zero runtime reflection.
 
+  Supports explicit-presence fields (`optional: true`) and mutually exclusive
+  `oneof` groups matching Protobuf Editions semantics.
+
   ## Example
 
       defmodule MyApp.Location do
@@ -26,8 +29,9 @@ defmodule OmniBuf.Schema do
     schema_name = Keyword.get(opts, :name)
 
     quote do
-      import OmniBuf.Schema, only: [field: 3, field: 4]
+      import OmniBuf.Schema, only: [field: 3, field: 4, oneof: 2]
       Module.register_attribute(__MODULE__, :omnibuf_fields, accumulate: true)
+      Module.register_attribute(__MODULE__, :omnibuf_oneofs, accumulate: true)
       @omnibuf_schema_name unquote(schema_name)
       @before_compile OmniBuf.Schema
     end
@@ -39,19 +43,32 @@ defmodule OmniBuf.Schema do
     end
   end
 
+  defmacro oneof(name, branches) do
+    quote do
+      @omnibuf_oneofs {unquote(name), unquote(branches)}
+    end
+  end
+
   defmacro __before_compile__(env) do
     raw_fields = Module.get_attribute(env.module, :omnibuf_fields) |> Enum.reverse()
-    validate_raw_fields!(raw_fields, env.module)
+    raw_oneofs = Module.get_attribute(env.module, :omnibuf_oneofs) |> Enum.reverse()
 
     schema_name =
       Module.get_attribute(env.module, :omnibuf_schema_name) || default_name(env.module)
 
     fields =
       raw_fields
-      |> Enum.sort_by(fn {num, _, _, _} -> num end)
       |> Enum.map(fn {num, name, type, opts} ->
         resolved_type = resolve_type(type, env)
-        default = Keyword.get(opts, :default, Codec.default_value(resolved_type))
+        optional = Keyword.get(opts, :optional, false)
+
+        default =
+          if Keyword.has_key?(opts, :default) do
+            Keyword.fetch!(opts, :default)
+          else
+            if optional, do: nil, else: Codec.default_value(resolved_type)
+          end
+
         wire_name = Keyword.get(opts, :wire_name, Atom.to_string(name))
         emit_empty = Keyword.get(opts, :emit_empty, false)
 
@@ -61,15 +78,81 @@ defmodule OmniBuf.Schema do
           type: resolved_type,
           default: default,
           wire_name: wire_name,
-          emit_empty: emit_empty
+          emit_empty: emit_empty,
+          optional: optional
         }
       end)
 
-    struct_fields = Enum.map(fields, fn f -> {f.name, f.default} end)
-    encode_exprs = Enum.map(fields, &gen_encode_field/1)
-    decode_clauses = Enum.map(fields, &gen_decode_clause/1)
-    meta_fields_ast = Enum.map(fields, fn f -> {f.number, f.wire_name} end)
-    meta_children_ast = gen_meta_children(fields)
+    oneofs =
+      Enum.map(raw_oneofs, fn {oneof_name, raw_branches} ->
+        if not is_list(raw_branches) do
+          raise ArgumentError,
+                "invalid OmniBuf oneof #{inspect(oneof_name)} in #{inspect(env.module)}: branches must be a list"
+        end
+
+        branches =
+          raw_branches
+          |> Enum.map(fn
+            {num, bname, btype} ->
+              {num, bname, btype, []}
+
+            {num, bname, btype, bopts} when is_list(bopts) ->
+              {num, bname, btype, bopts}
+
+            other ->
+              raise ArgumentError,
+                    "invalid OmniBuf oneof branch #{inspect(other)} in #{inspect(env.module)}"
+          end)
+          |> Enum.map(fn {num, bname, btype, bopts} ->
+            resolved_type = resolve_type(btype, env)
+            wire_name = Keyword.get(bopts, :wire_name, Atom.to_string(bname))
+
+            %{
+              number: num,
+              name: bname,
+              type: resolved_type,
+              wire_name: wire_name
+            }
+          end)
+
+        %{name: oneof_name, branches: branches}
+      end)
+
+    validate_schema!(fields, oneofs, env.module)
+
+    fields = Enum.sort_by(fields, & &1.number)
+    oneofs = Enum.map(oneofs, fn o -> %{o | branches: Enum.sort_by(o.branches, & &1.number)} end)
+
+    struct_fields =
+      Enum.map(fields, fn f -> {f.name, f.default} end) ++
+        Enum.map(oneofs, fn o -> {o.name, nil} end)
+
+    encode_exprs =
+      (Enum.map(fields, fn f -> {f.number, {:field, f}} end) ++
+         Enum.flat_map(oneofs, fn o ->
+           Enum.map(o.branches, fn b -> {b.number, {:oneof, o.name, b}} end)
+         end))
+      |> Enum.sort_by(fn {num, _} -> num end)
+      |> Enum.map(fn
+        {_, {:field, f}} -> gen_encode_field(f)
+        {_, {:oneof, oneof_name, branch}} -> gen_encode_oneof_branch(oneof_name, branch)
+      end)
+
+    decode_clauses =
+      Enum.map(fields, fn f -> gen_decode_clause(f.number, f.type, {:field, f.name}) end) ++
+        Enum.flat_map(oneofs, fn o ->
+          Enum.map(o.branches, fn b ->
+            gen_decode_clause(b.number, b.type, {:oneof, o.name, b.name})
+          end)
+        end)
+
+    meta_fields_ast =
+      Enum.map(fields, fn f -> {f.number, f.wire_name} end) ++
+        Enum.flat_map(oneofs, fn o ->
+          Enum.map(o.branches, fn b -> {b.number, b.wire_name} end)
+        end)
+
+    meta_children_ast = gen_meta_children(fields, oneofs)
 
     quote do
       defstruct unquote(Macro.escape(struct_fields))
@@ -78,7 +161,16 @@ defmodule OmniBuf.Schema do
       def __omnibuf_fields__, do: unquote(Macro.escape(fields))
 
       @doc false
+      def __omnibuf_oneofs__, do: unquote(Macro.escape(oneofs))
+
+      @doc false
       def __omnibuf_name__, do: unquote(schema_name)
+
+      @doc false
+      def encode_iodata_elixir(%__MODULE__{} = msg) do
+        _ = msg
+        [unquote_splicing(encode_exprs)]
+      end
 
       @doc """
       Returns the `OmniBuf.SchemaMeta` describing this message and its nested children.
@@ -110,7 +202,12 @@ defmodule OmniBuf.Schema do
           if depth + 2 > Wire.max_depth() do
             %{}
           else
-            OmniBuf.Schema.build_children_meta_for(msg, __omnibuf_fields__(), depth + 2)
+            OmniBuf.Schema.build_children_meta_for(
+              msg,
+              __omnibuf_fields__(),
+              __omnibuf_oneofs__(),
+              depth + 2
+            )
           end
 
         %SchemaMeta{
@@ -151,7 +248,7 @@ defmodule OmniBuf.Schema do
             body
           end
         else
-          body = [unquote_splicing(encode_exprs)]
+          body = encode_iodata_elixir(msg)
 
           if Keyword.get(opts, :self_describing, false) do
             [SchemaMeta.encode_field(schema_meta_for(msg, 1)), body]
@@ -316,32 +413,94 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp validate_raw_fields!(raw_fields, mod) do
+  defp validate_schema!(fields, oneofs, mod) do
     max_field = Wire.max_field_number()
 
-    Enum.reduce(raw_fields, {MapSet.new(), MapSet.new()}, fn {num, name, _type, _opts},
-                                                             {nums, names} ->
-      if not is_integer(num) or num < 1 or num > max_field do
+    {nums, struct_names} =
+      Enum.reduce(fields, {MapSet.new(), MapSet.new()}, fn %{
+                                                             number: num,
+                                                             name: name,
+                                                             type: type,
+                                                             optional: optional
+                                                           },
+                                                           {nums, names} ->
+        if not is_integer(num) or num < 1 or num > max_field do
+          raise ArgumentError,
+                "invalid OmniBuf field number #{inspect(num)} in #{inspect(mod)}: must be in 1..#{max_field}"
+        end
+
+        if not is_atom(name) or name == :__struct__ do
+          raise ArgumentError,
+                "invalid OmniBuf field name #{inspect(name)} in #{inspect(mod)}"
+        end
+
+        if MapSet.member?(nums, num) do
+          raise ArgumentError,
+                "duplicate OmniBuf field number #{num} in #{inspect(mod)}"
+        end
+
+        if MapSet.member?(names, name) do
+          raise ArgumentError,
+                "duplicate OmniBuf field name #{inspect(name)} in #{inspect(mod)}"
+        end
+
+        if optional and match?({:array, _}, type) do
+          raise ArgumentError,
+                "optional: true is not supported on array field #{inspect(name)} in #{inspect(mod)}"
+        end
+
+        if optional and match?({:map, _, _}, type) do
+          raise ArgumentError,
+                "optional: true is not supported on map field #{inspect(name)} in #{inspect(mod)}"
+        end
+
+        {MapSet.put(nums, num), MapSet.put(names, name)}
+      end)
+
+    Enum.reduce(oneofs, {nums, struct_names}, fn %{name: oneof_name, branches: branches},
+                                                 {nums, names} ->
+      if not is_atom(oneof_name) or oneof_name == :__struct__ do
         raise ArgumentError,
-              "invalid OmniBuf field number #{inspect(num)} in #{inspect(mod)}: must be in 1..#{max_field}"
+              "invalid OmniBuf oneof name #{inspect(oneof_name)} in #{inspect(mod)}"
       end
 
-      if not is_atom(name) or name == :__struct__ do
+      if MapSet.member?(names, oneof_name) do
         raise ArgumentError,
-              "invalid OmniBuf field name #{inspect(name)} in #{inspect(mod)}"
+              "duplicate OmniBuf field name #{inspect(oneof_name)} in #{inspect(mod)}"
       end
 
-      if MapSet.member?(nums, num) do
-        raise ArgumentError,
-              "duplicate OmniBuf field number #{num} in #{inspect(mod)}"
-      end
+      {nums, _branch_names} =
+        Enum.reduce(branches, {nums, MapSet.new()}, fn %{number: num, name: bname, type: btype},
+                                                       {n_acc, b_acc} ->
+          if not is_integer(num) or num < 1 or num > max_field do
+            raise ArgumentError,
+                  "invalid OmniBuf field number #{inspect(num)} in #{inspect(mod)}: must be in 1..#{max_field}"
+          end
 
-      if MapSet.member?(names, name) do
-        raise ArgumentError,
-              "duplicate OmniBuf field name #{inspect(name)} in #{inspect(mod)}"
-      end
+          if not is_atom(bname) or bname == :__struct__ do
+            raise ArgumentError,
+                  "invalid OmniBuf oneof branch name #{inspect(bname)} in #{inspect(mod)}"
+          end
 
-      {MapSet.put(nums, num), MapSet.put(names, name)}
+          if MapSet.member?(n_acc, num) do
+            raise ArgumentError,
+                  "duplicate OmniBuf field number #{num} in #{inspect(mod)}"
+          end
+
+          if MapSet.member?(b_acc, bname) do
+            raise ArgumentError,
+                  "duplicate OmniBuf oneof branch name #{inspect(bname)} in #{inspect(mod)}"
+          end
+
+          if match?({:array, _}, btype) or match?({:map, _, _}, btype) do
+            raise ArgumentError,
+                  "repeated/map field #{inspect(bname)} is not allowed in oneof #{inspect(oneof_name)} in #{inspect(mod)}"
+          end
+
+          {MapSet.put(n_acc, num), MapSet.put(b_acc, bname)}
+        end)
+
+      {nums, MapSet.put(names, oneof_name)}
     end)
 
     :ok
@@ -385,6 +544,18 @@ defmodule OmniBuf.Schema do
   # ---------------------------------------------------------------------------
   # Compile-time Encode Code Generation
   # ---------------------------------------------------------------------------
+
+  defp gen_encode_field(%{number: num, name: name, type: type, optional: true}) do
+    val_var = Macro.var(:val, __MODULE__)
+    encoded_ast = gen_encode_explicit_value(num, type, val_var)
+
+    quote do
+      case Map.fetch!(msg, unquote(name)) do
+        nil -> []
+        unquote(val_var) -> unquote(encoded_ast)
+      end
+    end
+  end
 
   defp gen_encode_field(%{number: num, name: name, type: :bool}) do
     tag_true = Wire.encode_tag(num, 3)
@@ -596,34 +767,172 @@ defmodule OmniBuf.Schema do
     end
   end
 
+  defp gen_encode_oneof_branch(oneof_name, %{number: num, name: bname, type: type}) do
+    val_var = Macro.var(:val, __MODULE__)
+    encoded_ast = gen_encode_explicit_value(num, type, val_var)
+
+    quote do
+      case Map.fetch!(msg, unquote(oneof_name)) do
+        {unquote(bname), nil} -> []
+        {unquote(bname), unquote(val_var)} -> unquote(encoded_ast)
+        _ -> []
+      end
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :bool, val_ast) do
+    tag_false = Wire.encode_tag(num, 2)
+    tag_true = Wire.encode_tag(num, 3)
+
+    quote do
+      if unquote(val_ast), do: unquote(tag_true), else: unquote(tag_false)
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :uint32, val_ast) do
+    tag = Wire.encode_tag(num, 0)
+
+    quote do
+      [unquote(tag), Wire.encode_varint(Wire.narrow_uint32(unquote(val_ast)))]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :uint64, val_ast) do
+    tag = Wire.encode_tag(num, 0)
+
+    quote do
+      [unquote(tag), Wire.encode_varint(unquote(val_ast))]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, t, val_ast)
+       when t in [:int32, :sint32, :enum] do
+    tag = Wire.encode_tag(num, 1)
+
+    quote do
+      [unquote(tag), Wire.encode_varint(Wire.encode_zigzag(Wire.narrow_int32(unquote(val_ast))))]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, {:enum, _}, val_ast) do
+    gen_encode_explicit_value(num, :enum, val_ast)
+  end
+
+  defp gen_encode_explicit_value(num, t, val_ast) when t in [:int64, :sint64] do
+    tag = Wire.encode_tag(num, 1)
+
+    quote do
+      [unquote(tag), Wire.encode_varint(Wire.encode_zigzag(unquote(val_ast)))]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :fixed32, val_ast) do
+    tag = Wire.encode_tag(num, 4)
+
+    quote do
+      [unquote(tag), <<Wire.narrow_uint32(unquote(val_ast))::little-unsigned-32>>]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :fixed64, val_ast) do
+    tag = Wire.encode_tag(num, 5)
+
+    quote do
+      [unquote(tag), <<unquote(val_ast)::little-unsigned-64>>]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :sfixed32, val_ast) do
+    tag = Wire.encode_tag(num, 6)
+
+    quote do
+      [unquote(tag), <<Wire.narrow_int32(unquote(val_ast))::little-signed-32>>]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :sfixed64, val_ast) do
+    tag = Wire.encode_tag(num, 7)
+
+    quote do
+      [unquote(tag), <<unquote(val_ast)::little-signed-64>>]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :float, val_ast) do
+    tag = Wire.encode_tag(num, 8)
+
+    quote do
+      [unquote(tag), Wire.encode_float32(unquote(val_ast))]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :double, val_ast) do
+    tag = Wire.encode_tag(num, 9)
+
+    quote do
+      [unquote(tag), Wire.encode_float64(unquote(val_ast))]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :string, val_ast) do
+    tag = Wire.encode_tag(num, 10)
+
+    quote do
+      [unquote(tag), Wire.encode_varint(byte_size(unquote(val_ast))), unquote(val_ast)]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, :bytes, val_ast) do
+    tag = Wire.encode_tag(num, 11)
+
+    quote do
+      [unquote(tag), Wire.encode_varint(byte_size(unquote(val_ast))), unquote(val_ast)]
+    end
+  end
+
+  defp gen_encode_explicit_value(num, {:message, mod}, val_ast) do
+    tag = Wire.encode_tag(num, 12)
+
+    quote do
+      [unquote(tag), Wire.encode_length_prefixed(unquote(mod).encode_iodata(unquote(val_ast)))]
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Compile-time Decode Clause Generation
   # ---------------------------------------------------------------------------
 
-  defp gen_decode_clause(%{number: num, name: name, type: :bool}) do
+  defp put_target_ast({:field, name}, val_ast) do
+    quote do: Map.put(acc, unquote(name), unquote(val_ast))
+  end
+
+  defp put_target_ast({:oneof, oneof_name, branch_name}, val_ast) do
+    quote do: Map.put(acc, unquote(oneof_name), {unquote(branch_name), unquote(val_ast)})
+  end
+
+  defp gen_decode_clause(num, :bool, target) do
+    put_false = put_target_ast(target, false)
+    put_true = put_target_ast(target, true)
+
     quote do
       defp decode_field(unquote(num), 2, rest, acc, array_chunks, depth, budget) do
-        decode_into_loop(rest, Map.put(acc, unquote(name), false), array_chunks, depth, budget)
+        decode_into_loop(rest, unquote(put_false), array_chunks, depth, budget)
       end
 
       defp decode_field(unquote(num), 3, rest, acc, array_chunks, depth, budget) do
-        decode_into_loop(rest, Map.put(acc, unquote(name), true), array_chunks, depth, budget)
+        decode_into_loop(rest, unquote(put_true), array_chunks, depth, budget)
       end
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: :uint32}) do
+  defp gen_decode_clause(num, :uint32, target) do
+    put_val = put_target_ast(target, quote(do: Wire.narrow_uint32(v)))
+
     quote do
       defp decode_field(unquote(num), 0, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_varint(rest) do
           {:ok, v, tail} ->
-            decode_into_loop(
-              tail,
-              Map.put(acc, unquote(name), Wire.narrow_uint32(v)),
-              array_chunks,
-              depth,
-              budget
-            )
+            decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -632,12 +941,14 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: :uint64}) do
+  defp gen_decode_clause(num, :uint64, target) do
+    put_val = put_target_ast(target, quote(do: v))
+
     quote do
       defp decode_field(unquote(num), 0, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_varint(rest) do
           {:ok, v, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth, budget)
+            decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -646,19 +957,14 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: t})
-       when t in [:int32, :sint32, :enum] do
+  defp gen_decode_clause(num, t, target) when t in [:int32, :sint32, :enum] do
+    put_val = put_target_ast(target, quote(do: Wire.narrow_int32(Wire.decode_zigzag(u))))
+
     quote do
       defp decode_field(unquote(num), 1, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_varint(rest) do
           {:ok, u, tail} ->
-            decode_into_loop(
-              tail,
-              Map.put(acc, unquote(name), Wire.narrow_int32(Wire.decode_zigzag(u))),
-              array_chunks,
-              depth,
-              budget
-            )
+            decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -667,22 +973,18 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: {:enum, _}}) do
-    gen_decode_clause(%{number: num, name: name, type: :enum})
+  defp gen_decode_clause(num, {:enum, _}, target) do
+    gen_decode_clause(num, :enum, target)
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: t}) when t in [:int64, :sint64] do
+  defp gen_decode_clause(num, t, target) when t in [:int64, :sint64] do
+    put_val = put_target_ast(target, quote(do: Wire.decode_zigzag(u)))
+
     quote do
       defp decode_field(unquote(num), 1, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_varint(rest) do
           {:ok, u, tail} ->
-            decode_into_loop(
-              tail,
-              Map.put(acc, unquote(name), Wire.decode_zigzag(u)),
-              array_chunks,
-              depth,
-              budget
-            )
+            decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -691,7 +993,9 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: :fixed32}) do
+  defp gen_decode_clause(num, :fixed32, target) do
+    put_val = put_target_ast(target, quote(do: v))
+
     quote do
       defp decode_field(
              unquote(num),
@@ -702,7 +1006,7 @@ defmodule OmniBuf.Schema do
              depth,
              budget
            ) do
-        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth, budget)
+        decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
       end
 
       defp decode_field(unquote(num), 4, _rest, _acc, _array_chunks, _depth, _budget) do
@@ -711,7 +1015,9 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: :fixed64}) do
+  defp gen_decode_clause(num, :fixed64, target) do
+    put_val = put_target_ast(target, quote(do: v))
+
     quote do
       defp decode_field(
              unquote(num),
@@ -722,7 +1028,7 @@ defmodule OmniBuf.Schema do
              depth,
              budget
            ) do
-        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth, budget)
+        decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
       end
 
       defp decode_field(unquote(num), 5, _rest, _acc, _array_chunks, _depth, _budget) do
@@ -731,7 +1037,9 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: :sfixed32}) do
+  defp gen_decode_clause(num, :sfixed32, target) do
+    put_val = put_target_ast(target, quote(do: v))
+
     quote do
       defp decode_field(
              unquote(num),
@@ -742,7 +1050,7 @@ defmodule OmniBuf.Schema do
              depth,
              budget
            ) do
-        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth, budget)
+        decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
       end
 
       defp decode_field(unquote(num), 6, _rest, _acc, _array_chunks, _depth, _budget) do
@@ -751,7 +1059,9 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: :sfixed64}) do
+  defp gen_decode_clause(num, :sfixed64, target) do
+    put_val = put_target_ast(target, quote(do: v))
+
     quote do
       defp decode_field(
              unquote(num),
@@ -762,7 +1072,7 @@ defmodule OmniBuf.Schema do
              depth,
              budget
            ) do
-        decode_into_loop(tail, Map.put(acc, unquote(name), v), array_chunks, depth, budget)
+        decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
       end
 
       defp decode_field(unquote(num), 7, _rest, _acc, _array_chunks, _depth, _budget) do
@@ -771,12 +1081,14 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: :float}) do
+  defp gen_decode_clause(num, :float, target) do
+    put_val = put_target_ast(target, quote(do: f))
+
     quote do
       defp decode_field(unquote(num), 8, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_float32(rest) do
           {:ok, f, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), f), array_chunks, depth, budget)
+            decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -785,12 +1097,14 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: :double}) do
+  defp gen_decode_clause(num, :double, target) do
+    put_val = put_target_ast(target, quote(do: f))
+
     quote do
       defp decode_field(unquote(num), 9, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_float64(rest) do
           {:ok, f, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), f), array_chunks, depth, budget)
+            decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -799,12 +1113,14 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: :string}) do
+  defp gen_decode_clause(num, :string, target) do
+    put_val = put_target_ast(target, quote(do: s))
+
     quote do
       defp decode_field(unquote(num), 10, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_string(rest) do
           {:ok, s, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), s), array_chunks, depth, budget)
+            decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -813,12 +1129,14 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: :bytes}) do
+  defp gen_decode_clause(num, :bytes, target) do
+    put_val = put_target_ast(target, quote(do: b))
+
     quote do
       defp decode_field(unquote(num), 11, rest, acc, array_chunks, depth, budget) do
         case Wire.decode_length_prefixed(rest) do
           {:ok, b, tail} ->
-            decode_into_loop(tail, Map.put(acc, unquote(name), b), array_chunks, depth, budget)
+            decode_into_loop(tail, unquote(put_val), array_chunks, depth, budget)
 
           {:error, _} = err ->
             err
@@ -827,7 +1145,7 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: {:message, mod}}) do
+  defp gen_decode_clause(num, {:message, mod}, {:field, name}) do
     quote do
       defp decode_field(unquote(num), 12, rest, acc, array_chunks, depth, budget) do
         existing = Map.fetch!(acc, unquote(name))
@@ -849,7 +1167,33 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: {:array, elem_type}}) do
+  defp gen_decode_clause(num, {:message, mod}, {:oneof, oneof_name, branch_name}) do
+    quote do
+      defp decode_field(unquote(num), 12, rest, acc, array_chunks, depth, budget) do
+        existing =
+          case Map.fetch!(acc, unquote(oneof_name)) do
+            {unquote(branch_name), sub} -> sub
+            _ -> nil
+          end
+
+        case Codec.decode_submsg(unquote(mod), rest, existing, depth, budget) do
+          {:ok, sub, tail, new_budget} ->
+            decode_into_loop(
+              tail,
+              Map.put(acc, unquote(oneof_name), {unquote(branch_name), sub}),
+              array_chunks,
+              depth,
+              new_budget
+            )
+
+          {:error, _} = err ->
+            err
+        end
+      end
+    end
+  end
+
+  defp gen_decode_clause(num, {:array, elem_type}, {:field, name}) do
     quote do
       defp decode_field(unquote(num), 13, rest, acc, array_chunks, depth, budget) do
         case Codec.decode_array(rest, unquote(Macro.escape(elem_type)), depth, budget) do
@@ -864,7 +1208,7 @@ defmodule OmniBuf.Schema do
     end
   end
 
-  defp gen_decode_clause(%{number: num, name: name, type: {:map, kt, vt}}) do
+  defp gen_decode_clause(num, {:map, kt, vt}, {:field, name}) do
     quote do
       defp decode_field(unquote(num), 14, rest, acc, array_chunks, depth, budget) do
         existing = Map.fetch!(acc, unquote(name))
@@ -897,14 +1241,26 @@ defmodule OmniBuf.Schema do
   # SchemaMeta Child Resolution (cycle-safe for self-referential schemas like TreeNode)
   # ---------------------------------------------------------------------------
 
-  defp gen_meta_children(fields) do
-    child_entries =
+  defp gen_meta_children(fields, oneofs) do
+    field_entries =
       Enum.flat_map(fields, fn f ->
         case extract_child_module(f.type) do
           nil -> []
           mod -> [{f.number, mod}]
         end
       end)
+
+    oneof_entries =
+      Enum.flat_map(oneofs, fn o ->
+        Enum.flat_map(o.branches, fn b ->
+          case extract_child_module(b.type) do
+            nil -> []
+            mod -> [{b.number, mod}]
+          end
+        end)
+      end)
+
+    child_entries = field_entries ++ oneof_entries
 
     if child_entries == [] do
       quote do: %{}
@@ -936,18 +1292,49 @@ defmodule OmniBuf.Schema do
 
   @doc false
   def build_children_meta_for(msg, fields, child_depth) do
-    Enum.reduce(fields, %{}, fn %{number: num, name: name, type: type}, acc ->
-      case extract_child_module(type) do
-        nil ->
-          acc
+    build_children_meta_for(msg, fields, [], child_depth)
+  end
 
-        mod ->
-          val = Map.get(msg, name)
+  @doc false
+  def build_children_meta_for(msg, fields, oneofs, child_depth) do
+    acc =
+      Enum.reduce(fields, %{}, fn %{number: num, name: name, type: type}, acc ->
+        case extract_child_module(type) do
+          nil ->
+            acc
 
-          case collect_child_meta(type, val, mod, child_depth) do
-            nil -> acc
-            meta -> Map.put(acc, num, meta)
+          mod ->
+            val = Map.get(msg, name)
+
+            case collect_child_meta(type, val, mod, child_depth) do
+              nil -> acc
+              meta -> Map.put(acc, num, meta)
+            end
+        end
+      end)
+
+    Enum.reduce(oneofs, acc, fn %{name: oneof_name, branches: branches}, acc ->
+      case Map.get(msg, oneof_name) do
+        {branch_name, val} when not is_nil(val) ->
+          case Enum.find(branches, &(&1.name == branch_name)) do
+            %{number: num, type: type} ->
+              case extract_child_module(type) do
+                nil ->
+                  acc
+
+                mod ->
+                  case collect_child_meta(type, val, mod, child_depth) do
+                    nil -> acc
+                    meta -> Map.put(acc, num, meta)
+                  end
+              end
+
+            nil ->
+              acc
           end
+
+        _ ->
+          acc
       end
     end)
   end

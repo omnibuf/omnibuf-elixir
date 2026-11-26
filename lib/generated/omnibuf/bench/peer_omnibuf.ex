@@ -610,10 +610,10 @@ defmodule Omnibuf.Bench.PeerUpdate.Opaque do
       {:ok, nil} ->
         Omnibuf.Bench.Location.Opaque.new(<<>>)
 
-      {:ok, %Omnibuf.Bench.Location{} = sub} ->
+      {:ok, %{__struct__: Omnibuf.Bench.Location} = sub} ->
         Omnibuf.Bench.Location.Opaque.new(Omnibuf.Bench.Location.encode(sub))
 
-      {:ok, %Omnibuf.Bench.Location.Opaque{} = sub_op} ->
+      {:ok, %{__struct__: Omnibuf.Bench.Location.Opaque} = sub_op} ->
         sub_op
 
       :error ->
@@ -824,7 +824,7 @@ defmodule Omnibuf.Bench.PeerUpdate.Opaque do
     }
   end
 
-  def set_location(%__MODULE__{} = op, %Omnibuf.Bench.Location{} = val) do
+  def set_location(%__MODULE__{} = op, %{__struct__: Omnibuf.Bench.Location} = val) do
     wire = [
       <<114, 2>>,
       OmniBuf.Wire.encode_length_prefixed(Omnibuf.Bench.Location.encode_iodata(val))

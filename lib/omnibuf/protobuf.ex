@@ -130,7 +130,7 @@ defmodule OmniBuf.Protobuf do
       case fp.oneof do
         nil ->
           val = Map.get(msg, fp.name_atom)
-          encode_field(fp, val, false)
+          encode_field(fp, val, explicit_presence_field?(props.syntax, fp))
 
         idx ->
           oneof_key = Map.fetch!(oneof_names, idx)
@@ -142,6 +142,14 @@ defmodule OmniBuf.Protobuf do
       end
     end)
   end
+
+  defp explicit_presence_field?(_syntax, %{proto3_optional?: true}), do: true
+  defp explicit_presence_field?(:proto3, _fp), do: false
+  defp explicit_presence_field?(_syntax, %{repeated?: true}), do: false
+  defp explicit_presence_field?(_syntax, %{map?: true}), do: false
+  defp explicit_presence_field?(_syntax, %{optional?: true}), do: true
+  defp explicit_presence_field?(_syntax, %{required?: true}), do: true
+  defp explicit_presence_field?(_syntax, _fp), do: false
 
   defp encode_field(%{map?: true} = fp, val, _explicit?) do
     case val do
@@ -571,7 +579,14 @@ defmodule OmniBuf.Protobuf do
   defp decode_pb_element(%{enum?: true, type: {:enum, enum_mod}}, bin, _depth, budget) do
     with {:ok, u, tail} <- Wire.decode_varint(bin) do
       int_val = Wire.narrow_int32(Wire.decode_zigzag(u))
-      val = enum_mod.key(int_val)
+
+      val =
+        try do
+          enum_mod.key(int_val)
+        rescue
+          FunctionClauseError -> int_val
+        end
+
       {:ok, val, tail, budget}
     end
   end

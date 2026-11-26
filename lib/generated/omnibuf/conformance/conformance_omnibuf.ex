@@ -926,12 +926,12 @@ defmodule Omnibuf.Conformance.TestAllTypes.Opaque do
       {:ok, nil} ->
         Omnibuf.Conformance.AllTypesSubMsg.Opaque.new(<<>>)
 
-      {:ok, %Omnibuf.Conformance.AllTypesSubMsg{} = sub} ->
+      {:ok, %{__struct__: Omnibuf.Conformance.AllTypesSubMsg} = sub} ->
         Omnibuf.Conformance.AllTypesSubMsg.Opaque.new(
           Omnibuf.Conformance.AllTypesSubMsg.encode(sub)
         )
 
-      {:ok, %Omnibuf.Conformance.AllTypesSubMsg.Opaque{} = sub_op} ->
+      {:ok, %{__struct__: Omnibuf.Conformance.AllTypesSubMsg.Opaque} = sub_op} ->
         sub_op
 
       :error ->
@@ -1268,7 +1268,7 @@ defmodule Omnibuf.Conformance.TestAllTypes.Opaque do
     }
   end
 
-  def set_f8_sub_msg(%__MODULE__{} = op, %Omnibuf.Conformance.AllTypesSubMsg{} = val) do
+  def set_f8_sub_msg(%__MODULE__{} = op, %{__struct__: Omnibuf.Conformance.AllTypesSubMsg} = val) do
     wire = [
       <<50, 2>>,
       OmniBuf.Wire.encode_length_prefixed(Omnibuf.Conformance.AllTypesSubMsg.encode_iodata(val))

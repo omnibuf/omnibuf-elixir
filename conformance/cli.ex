@@ -11,7 +11,17 @@ defmodule OmniBuf.Conformance.CLI do
   alias OmniBuf.Conformance.PB
   alias OmniBuf.Conformance.Struct, as: S
   alias Omnibuf.Bench.{Location, PeerUpdate}
-  alias Omnibuf.Conformance.{AllTypesSubMsg, TestAllTypes}
+
+  alias Omnibuf.Conformance.{
+    AllTypesSubMsg,
+    Editions2023Child,
+    Editions2024Child,
+    Editions2026Child,
+    TestAllTypes,
+    TestEditions2023,
+    TestEditions2024,
+    TestEditions2026
+  }
 
   @max_frame_bytes 16 * 1024 * 1024
   @wire_format_json 2
@@ -161,8 +171,41 @@ defmodule OmniBuf.Conformance.CLI do
     end
   end
 
+  defp handle_plugin(%Request{message_type: "omnibuf.conformance.TestEditions2023"} = req) do
+    do_plugin_editions(
+      TestEditions2023,
+      TestEditions2023.Opaque,
+      Editions2023Child.Opaque,
+      "TestEditions2023",
+      req
+    )
+  end
+
+  defp handle_plugin(%Request{message_type: "omnibuf.conformance.TestEditions2024"} = req) do
+    do_plugin_editions(
+      TestEditions2024,
+      TestEditions2024.Opaque,
+      Editions2024Child.Opaque,
+      "TestEditions2024",
+      req
+    )
+  end
+
+  defp handle_plugin(%Request{message_type: "omnibuf.conformance.TestEditions2026"} = req) do
+    do_plugin_editions(
+      TestEditions2026,
+      TestEditions2026.Opaque,
+      Editions2026Child.Opaque,
+      "TestEditions2026",
+      req
+    )
+  end
+
   defp handle_plugin(%Request{}) do
-    %Response{skipped: "plugin tier generated for PeerUpdate and TestAllTypes"}
+    %Response{
+      skipped:
+        "plugin tier generated for PeerUpdate, TestAllTypes, and TestEditions2023/2024/2026"
+    }
   end
 
   defp do_plugin_peer_update(%Request{omnibuf_payload: payload} = req) do
@@ -409,36 +452,117 @@ defmodule OmniBuf.Conformance.CLI do
     end
   end
 
-  defp float_eq?(a, b) when is_float(a) and is_float(b), do: a == b
+  defp do_plugin_editions(
+         mod,
+         op_mod,
+         child_op_mod,
+         label,
+         %Request{omnibuf_payload: payload} = req
+       ) do
+    case mod.decode(payload) do
+      {:error, %Error{message: msg}} ->
+        %Response{parse_error: msg}
+
+      {:ok, msg} ->
+        op = op_mod.new(payload)
+
+        case verify_editions_opaque(msg, op, op_mod, child_op_mod, label) do
+          :ok ->
+            %Response{
+              omnibuf_payload: mod.encode(msg, self_describing: req.self_describing)
+            }
+
+          {:error, reason} ->
+            %Response{runtime_error: reason}
+        end
+    end
+  end
+
+  defp verify_editions_opaque(msg, op, op_mod, child_op_mod, label) do
+    checks = [
+      {"explicit_int", op_mod.get_explicit_int(op) == msg.explicit_int},
+      {"has_explicit_int?", op_mod.has_explicit_int?(op) == (msg.explicit_int != nil)},
+      {"explicit_bool", op_mod.get_explicit_bool(op) == msg.explicit_bool},
+      {"has_explicit_bool?", op_mod.has_explicit_bool?(op) == (msg.explicit_bool != nil)},
+      {"explicit_string", op_mod.get_explicit_string(op) == msg.explicit_string},
+      {"has_explicit_string?", op_mod.has_explicit_string?(op) == (msg.explicit_string != nil)},
+      {"explicit_bytes", op_mod.get_explicit_bytes(op) == msg.explicit_bytes},
+      {"has_explicit_bytes?", op_mod.has_explicit_bytes?(op) == (msg.explicit_bytes != nil)},
+      {"explicit_double", float_eq?(op_mod.get_explicit_double(op), msg.explicit_double)},
+      {"has_explicit_double?", op_mod.has_explicit_double?(op) == (msg.explicit_double != nil)},
+      {"status", op_mod.get_status(op) == msg.status},
+      {"has_status?", op_mod.has_status?(op) == (msg.status != nil)},
+      {"implicit_count", op_mod.get_implicit_count(op) == msg.implicit_count},
+      {"implicit_flag", op_mod.get_implicit_flag(op) == msg.implicit_flag},
+      {"has_child?", op_mod.has_child?(op) == (msg.child != nil)},
+      {"child", op_mod.decode_child(op) == msg.child},
+      {"child_opaque",
+       verify_editions_child_opaque(msg.child, op_mod.get_child(op), child_op_mod)},
+      {"has_delimited_child?", op_mod.has_delimited_child?(op) == (msg.delimited_child != nil)},
+      {"delimited_child", op_mod.decode_delimited_child(op) == msg.delimited_child},
+      {"delimited_child_opaque",
+       verify_editions_child_opaque(
+         msg.delimited_child,
+         op_mod.get_delimited_child(op),
+         child_op_mod
+       )},
+      {"packed_vals", op_mod.get_packed_vals(op) == msg.packed_vals},
+      {"expanded_vals", op_mod.get_expanded_vals(op) == msg.expanded_vals},
+      {"scores", op_mod.get_scores(op) == msg.scores},
+      {"choice", op_mod.get_choice(op) == msg.choice}
+    ]
+
+    case Enum.find(checks, fn {_name, ok} -> not ok end) do
+      nil -> :ok
+      {field, false} -> {:error, "Opaque#{label} getter mismatch on #{field}"}
+    end
+  end
+
+  defp verify_editions_child_opaque(nil, _child_op, _child_op_mod), do: true
+
+  defp verify_editions_child_opaque(child, child_op, child_op_mod) do
+    child_op_mod.get_id(child_op) == child.id and
+      child_op_mod.has_id?(child_op) == (child.id != nil) and
+      child_op_mod.get_note(child_op) == child.note and
+      child_op_mod.has_note?(child_op) == (child.note != nil)
+  end
+
+  defp float_eq?(a, b) when is_float(a) and is_float(b),
+    do: <<a::little-float-64>> == <<b::little-float-64>>
+
   defp float_eq?(a, b), do: a == b
 
   # ---------------------------------------------------------------------------
   # Tier 2: Standard elixir-protobuf Types
   # ---------------------------------------------------------------------------
 
-  defp handle_protobuf(%Request{message_type: "omnibuf.bench.PeerUpdate"} = req) do
-    case Protobuf.decode(req.omnibuf_payload, PB.PeerUpdate) do
-      {:ok, msg} ->
-        %Response{omnibuf_payload: Protobuf.encode(msg, self_describing: req.self_describing)}
+  defp handle_protobuf(%Request{message_type: type} = req) do
+    case protobuf_module_for(type) do
+      :error ->
+        %Response{
+          skipped:
+            "protobuf tier defined for PeerUpdate, TestAllTypes, and TestEditions2023/2024/2026"
+        }
 
-      {:error, %Error{message: msg}} ->
-        %Response{parse_error: msg}
+      {:ok, mod} ->
+        case Protobuf.decode(req.omnibuf_payload, mod) do
+          {:ok, msg} ->
+            %Response{
+              omnibuf_payload: Protobuf.encode(msg, self_describing: req.self_describing)
+            }
+
+          {:error, %Error{message: msg}} ->
+            %Response{parse_error: msg}
+        end
     end
   end
 
-  defp handle_protobuf(%Request{message_type: "omnibuf.conformance.TestAllTypes"} = req) do
-    case Protobuf.decode(req.omnibuf_payload, PB.TestAllTypes) do
-      {:ok, msg} ->
-        %Response{omnibuf_payload: Protobuf.encode(msg, self_describing: req.self_describing)}
-
-      {:error, %Error{message: msg}} ->
-        %Response{parse_error: msg}
-    end
-  end
-
-  defp handle_protobuf(%Request{}) do
-    %Response{skipped: "protobuf tier defined for PeerUpdate and TestAllTypes"}
-  end
+  defp protobuf_module_for("omnibuf.bench.PeerUpdate"), do: {:ok, PB.PeerUpdate}
+  defp protobuf_module_for("omnibuf.conformance.TestAllTypes"), do: {:ok, PB.TestAllTypes}
+  defp protobuf_module_for("omnibuf.conformance.TestEditions2023"), do: {:ok, PB.TestEditions2023}
+  defp protobuf_module_for("omnibuf.conformance.TestEditions2024"), do: {:ok, PB.TestEditions2024}
+  defp protobuf_module_for("omnibuf.conformance.TestEditions2026"), do: {:ok, PB.TestEditions2026}
+  defp protobuf_module_for(_), do: :error
 
   # ---------------------------------------------------------------------------
   # Tier 3: Declarative OmniBuf.Schema Structs
