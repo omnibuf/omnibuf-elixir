@@ -154,6 +154,11 @@ impl DecodeErr {
                 Self::new(reason, msg)
             }
             omnibuf::Error::Serialize(msg) => Self::new(atoms::serialize(), msg),
+            other => {
+                let msg = other.to_string();
+                let reason = classify_parse_error(&msg);
+                Self::new(reason, msg)
+            }
         }
     }
 }
