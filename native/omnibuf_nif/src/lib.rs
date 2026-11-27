@@ -26,6 +26,7 @@ pub mod atoms {
         ok,
         error,
         nil,
+        dirty,
         found,
         not_found,
         __struct__,
@@ -694,7 +695,7 @@ fn nif_compile_schema<'a>(msg_list: Term<'a>) -> NifResult<ResourceArc<CompiledS
     Ok(ResourceArc::new(compiled))
 }
 
-fn encode_struct_impl<'a>(
+fn encode_struct_impl<'a, const BOUNDED: bool>(
     env: Env<'a>,
     schema: ResourceArc<CompiledSchema>,
     msg: Term<'a>,
@@ -702,8 +703,20 @@ fn encode_struct_impl<'a>(
     ENCODE_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.clear();
-        let res = schema::encode_message(&schema, 0, msg, &mut buf, 0);
-        let out = res.map(|()| make_bytes(env, &buf));
+        let mut remaining_elems = schema::NORMAL_ENCODE_MAX_ELEMS;
+        let res =
+            schema::encode_message::<BOUNDED>(&schema, 0, msg, &mut buf, 0, &mut remaining_elems);
+        let out = match res {
+            Ok(()) => Ok(make_bytes(env, &buf)),
+            Err(schema::EncodeErr::DirtyYield) => {
+                buf.clear();
+                if buf.capacity() > 1024 {
+                    buf.shrink_to(1024);
+                }
+                Ok(atoms::dirty().encode(env))
+            }
+            Err(schema::EncodeErr::Nif(err)) => Err(err),
+        };
         if buf.capacity() > MAX_RETAINED_SCRATCH {
             buf.clear();
             buf.shrink_to(1024);
@@ -718,7 +731,7 @@ fn nif_encode_struct<'a>(
     schema: ResourceArc<CompiledSchema>,
     msg: Term<'a>,
 ) -> NifResult<Term<'a>> {
-    encode_struct_impl(env, schema, msg)
+    encode_struct_impl::<true>(env, schema, msg)
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -727,7 +740,7 @@ fn nif_encode_struct_dirty<'a>(
     schema: ResourceArc<CompiledSchema>,
     msg: Term<'a>,
 ) -> NifResult<Term<'a>> {
-    encode_struct_impl(env, schema, msg)
+    encode_struct_impl::<false>(env, schema, msg)
 }
 
 fn decode_struct_impl<'a>(

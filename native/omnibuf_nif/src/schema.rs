@@ -17,6 +17,20 @@ use crate::atoms;
 
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_ELEMENTS: usize = 4_194_304;
+pub const NORMAL_ENCODE_MAX_BYTES: usize = 256 * 1024;
+pub const NORMAL_ENCODE_MAX_ELEMS: usize = 8_192;
+
+pub enum EncodeErr {
+    Nif(rustler::Error),
+    DirtyYield,
+}
+
+impl From<rustler::Error> for EncodeErr {
+    #[inline]
+    fn from(err: rustler::Error) -> Self {
+        Self::Nif(err)
+    }
+}
 
 pub struct DecodeBudget {
     pub max_elements: usize,
@@ -438,15 +452,16 @@ fn is_nil(term: Term<'_>) -> bool {
     matches!(term.decode::<Atom>(), Ok(a) if a == atoms::nil())
 }
 
-pub fn encode_message<'a>(
+pub fn encode_message<'a, const BOUNDED: bool>(
     schema: &CompiledSchema,
     msg_idx: usize,
     msg_term: Term<'a>,
     dst: &mut Vec<u8>,
     depth: usize,
-) -> NifResult<()> {
+    remaining_elems: &mut usize,
+) -> Result<(), EncodeErr> {
     if depth > MAX_NESTING_DEPTH {
-        return Err(rustler::Error::BadArg);
+        return Err(EncodeErr::Nif(rustler::Error::BadArg));
     }
     let msg_schema = &schema.messages[msg_idx];
 
@@ -534,6 +549,9 @@ pub fn encode_message<'a>(
                 let bin: Binary<'a> = val.decode()?;
                 let slice = bin.as_slice();
                 if !slice.is_empty() {
+                    if BOUNDED && dst.len().saturating_add(slice.len()) > NORMAL_ENCODE_MAX_BYTES {
+                        return Err(EncodeErr::DirtyYield);
+                    }
                     dst.extend_from_slice(tag);
                     append_bytes_elem(dst, slice);
                 }
@@ -541,12 +559,25 @@ pub fn encode_message<'a>(
             ElemKind::Message(sub_idx) => {
                 if !is_nil(val) {
                     if depth + 1 > MAX_NESTING_DEPTH {
-                        return Err(rustler::Error::BadArg);
+                        return Err(EncodeErr::Nif(rustler::Error::BadArg));
+                    }
+                    if BOUNDED {
+                        if *remaining_elems == 0 || dst.len() > NORMAL_ENCODE_MAX_BYTES {
+                            return Err(EncodeErr::DirtyYield);
+                        }
+                        *remaining_elems -= 1;
                     }
                     dst.extend_from_slice(tag);
                     let len_pos = dst.len();
                     dst.push(0);
-                    encode_message(schema, *sub_idx, val, dst, depth + 1)?;
+                    encode_message::<BOUNDED>(
+                        schema,
+                        *sub_idx,
+                        val,
+                        dst,
+                        depth + 1,
+                        remaining_elems,
+                    )?;
                     let sub_len = dst.len() - (len_pos + 1);
                     patch_reserved_varint(dst, len_pos, sub_len as u64);
                 }
@@ -555,20 +586,37 @@ pub fn encode_message<'a>(
                 let list_len = val.list_length()?;
                 if list_len > 0 || f.emit_empty {
                     if depth + 1 > MAX_NESTING_DEPTH {
-                        return Err(rustler::Error::BadArg);
+                        return Err(EncodeErr::Nif(rustler::Error::BadArg));
                     }
                     dst.extend_from_slice(tag);
-                    encode_array_body(schema, elem_kind, val, list_len, dst, depth + 1)?;
+                    encode_array_body::<BOUNDED>(
+                        schema,
+                        elem_kind,
+                        val,
+                        list_len,
+                        dst,
+                        depth + 1,
+                        remaining_elems,
+                    )?;
                 }
             }
             ElemKind::Map(k_kind, v_kind) => {
                 let map_len = val.map_size()?;
                 if map_len > 0 || f.emit_empty {
                     if depth + 1 > MAX_NESTING_DEPTH {
-                        return Err(rustler::Error::BadArg);
+                        return Err(EncodeErr::Nif(rustler::Error::BadArg));
                     }
                     dst.extend_from_slice(tag);
-                    encode_map_body(schema, k_kind, v_kind, val, map_len, dst, depth + 1)?;
+                    encode_map_body::<BOUNDED>(
+                        schema,
+                        k_kind,
+                        v_kind,
+                        val,
+                        map_len,
+                        dst,
+                        depth + 1,
+                        remaining_elems,
+                    )?;
                 }
             }
         }
@@ -577,14 +625,22 @@ pub fn encode_message<'a>(
     Ok(())
 }
 
-fn encode_array_body<'a>(
+fn encode_array_body<'a, const BOUNDED: bool>(
     schema: &CompiledSchema,
     elem_kind: &ElemKind,
     list_term: Term<'a>,
     list_len: usize,
     dst: &mut Vec<u8>,
     depth: usize,
-) -> NifResult<()> {
+    remaining_elems: &mut usize,
+) -> Result<(), EncodeErr> {
+    if BOUNDED {
+        if list_len > *remaining_elems || dst.len() > NORMAL_ENCODE_MAX_BYTES {
+            return Err(EncodeErr::DirtyYield);
+        }
+        *remaining_elems -= list_len;
+    }
+
     let len_pos = dst.len();
     dst.push(0);
     dst.push(elem_kind.wire_type());
@@ -592,7 +648,7 @@ fn encode_array_body<'a>(
 
     let iter: ListIterator<'a> = list_term.decode()?;
     for item in iter {
-        encode_element(schema, elem_kind, item, dst, depth)?;
+        encode_element::<BOUNDED>(schema, elem_kind, item, dst, depth, remaining_elems)?;
     }
 
     let body_len = dst.len() - (len_pos + 1);
@@ -600,7 +656,8 @@ fn encode_array_body<'a>(
     Ok(())
 }
 
-fn encode_map_body<'a>(
+#[allow(clippy::too_many_arguments)]
+fn encode_map_body<'a, const BOUNDED: bool>(
     schema: &CompiledSchema,
     k_kind: &ElemKind,
     v_kind: &ElemKind,
@@ -608,7 +665,15 @@ fn encode_map_body<'a>(
     map_len: usize,
     dst: &mut Vec<u8>,
     depth: usize,
-) -> NifResult<()> {
+    remaining_elems: &mut usize,
+) -> Result<(), EncodeErr> {
+    if BOUNDED {
+        if map_len > *remaining_elems || dst.len() > NORMAL_ENCODE_MAX_BYTES {
+            return Err(EncodeErr::DirtyYield);
+        }
+        *remaining_elems -= map_len;
+    }
+
     let len_pos = dst.len();
     dst.push(0);
     dst.push(k_kind.wire_type());
@@ -620,13 +685,26 @@ fn encode_map_body<'a>(
         match k_kind {
             ElemKind::String => {
                 let mut pairs: Vec<(Binary<'a>, Term<'a>)> = Vec::with_capacity(map_len);
+                let mut key_bytes = dst.len();
                 for (k, v) in iter {
-                    pairs.push((k.decode()?, v));
+                    let kb: Binary<'a> = k.decode()?;
+                    if BOUNDED {
+                        key_bytes = key_bytes.saturating_add(kb.as_slice().len());
+                        if key_bytes > NORMAL_ENCODE_MAX_BYTES {
+                            return Err(EncodeErr::DirtyYield);
+                        }
+                    }
+                    pairs.push((kb, v));
                 }
                 pairs.sort_unstable_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
                 for (k, v) in pairs {
-                    append_bytes_elem(dst, k.as_slice());
-                    encode_element(schema, v_kind, v, dst, depth)?;
+                    let k_slice = k.as_slice();
+                    if BOUNDED && dst.len().saturating_add(k_slice.len()) > NORMAL_ENCODE_MAX_BYTES
+                    {
+                        return Err(EncodeErr::DirtyYield);
+                    }
+                    append_bytes_elem(dst, k_slice);
+                    encode_element::<BOUNDED>(schema, v_kind, v, dst, depth, remaining_elems)?;
                 }
             }
             ElemKind::Uint32 | ElemKind::Fixed32 => {
@@ -641,7 +719,7 @@ fn encode_map_body<'a>(
                         ElemKind::Fixed32 => dst.extend_from_slice(&k.to_le_bytes()),
                         _ => unreachable!(),
                     }
-                    encode_element(schema, v_kind, v, dst, depth)?;
+                    encode_element::<BOUNDED>(schema, v_kind, v, dst, depth, remaining_elems)?;
                 }
             }
             ElemKind::Uint64 | ElemKind::Fixed64 => {
@@ -656,7 +734,7 @@ fn encode_map_body<'a>(
                         ElemKind::Fixed64 => dst.extend_from_slice(&k.to_le_bytes()),
                         _ => unreachable!(),
                     }
-                    encode_element(schema, v_kind, v, dst, depth)?;
+                    encode_element::<BOUNDED>(schema, v_kind, v, dst, depth, remaining_elems)?;
                 }
             }
             ElemKind::Sint32 | ElemKind::Sfixed32 => {
@@ -671,7 +749,7 @@ fn encode_map_body<'a>(
                         ElemKind::Sfixed32 => dst.extend_from_slice(&k.to_le_bytes()),
                         _ => unreachable!(),
                     }
-                    encode_element(schema, v_kind, v, dst, depth)?;
+                    encode_element::<BOUNDED>(schema, v_kind, v, dst, depth, remaining_elems)?;
                 }
             }
             ElemKind::Sint64 | ElemKind::Sfixed64 => {
@@ -686,7 +764,7 @@ fn encode_map_body<'a>(
                         ElemKind::Sfixed64 => dst.extend_from_slice(&k.to_le_bytes()),
                         _ => unreachable!(),
                     }
-                    encode_element(schema, v_kind, v, dst, depth)?;
+                    encode_element::<BOUNDED>(schema, v_kind, v, dst, depth, remaining_elems)?;
                 }
             }
             ElemKind::Bool => {
@@ -697,10 +775,10 @@ fn encode_map_body<'a>(
                 pairs.sort_unstable_by_key(|p| p.0);
                 for (k, v) in pairs {
                     dst.push(if k { 1 } else { 0 });
-                    encode_element(schema, v_kind, v, dst, depth)?;
+                    encode_element::<BOUNDED>(schema, v_kind, v, dst, depth, remaining_elems)?;
                 }
             }
-            _ => return Err(rustler::Error::BadArg),
+            _ => return Err(EncodeErr::Nif(rustler::Error::BadArg)),
         }
     }
 
@@ -709,13 +787,14 @@ fn encode_map_body<'a>(
     Ok(())
 }
 
-fn encode_element<'a>(
+fn encode_element<'a, const BOUNDED: bool>(
     schema: &CompiledSchema,
     kind: &ElemKind,
     val: Term<'a>,
     dst: &mut Vec<u8>,
     depth: usize,
-) -> NifResult<()> {
+    remaining_elems: &mut usize,
+) -> Result<(), EncodeErr> {
     match kind {
         ElemKind::Uint32 => {
             let v = decode_u64_narrow(val)? as u32;
@@ -760,35 +839,59 @@ fn encode_element<'a>(
         }
         ElemKind::String | ElemKind::Bytes => {
             let bin: Binary<'a> = val.decode()?;
-            append_bytes_elem(dst, bin.as_slice());
+            let slice = bin.as_slice();
+            if BOUNDED && dst.len().saturating_add(slice.len()) > NORMAL_ENCODE_MAX_BYTES {
+                return Err(EncodeErr::DirtyYield);
+            }
+            append_bytes_elem(dst, slice);
         }
         ElemKind::Message(sub_idx) => {
             if is_nil(val) {
                 dst.push(0x01);
             } else {
                 if depth + 1 > MAX_NESTING_DEPTH {
-                    return Err(rustler::Error::BadArg);
+                    return Err(EncodeErr::Nif(rustler::Error::BadArg));
+                }
+                if BOUNDED && dst.len() > NORMAL_ENCODE_MAX_BYTES {
+                    return Err(EncodeErr::DirtyYield);
                 }
                 let len_pos = dst.len();
                 dst.push(0);
-                encode_message(schema, *sub_idx, val, dst, depth + 1)?;
+                encode_message::<BOUNDED>(schema, *sub_idx, val, dst, depth + 1, remaining_elems)?;
                 let sub_len = dst.len() - (len_pos + 1);
                 patch_reserved_varint(dst, len_pos, sub_len as u64);
             }
         }
         ElemKind::Array(inner) => {
             if depth + 1 > MAX_NESTING_DEPTH {
-                return Err(rustler::Error::BadArg);
+                return Err(EncodeErr::Nif(rustler::Error::BadArg));
             }
             let list_len = val.list_length()?;
-            encode_array_body(schema, inner, val, list_len, dst, depth + 1)?;
+            encode_array_body::<BOUNDED>(
+                schema,
+                inner,
+                val,
+                list_len,
+                dst,
+                depth + 1,
+                remaining_elems,
+            )?;
         }
         ElemKind::Map(k_kind, v_kind) => {
             if depth + 1 > MAX_NESTING_DEPTH {
-                return Err(rustler::Error::BadArg);
+                return Err(EncodeErr::Nif(rustler::Error::BadArg));
             }
             let map_len = val.map_size()?;
-            encode_map_body(schema, k_kind, v_kind, val, map_len, dst, depth + 1)?;
+            encode_map_body::<BOUNDED>(
+                schema,
+                k_kind,
+                v_kind,
+                val,
+                map_len,
+                dst,
+                depth + 1,
+                remaining_elems,
+            )?;
         }
     }
     Ok(())

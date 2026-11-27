@@ -88,10 +88,9 @@ defmodule OmniBuf.Native do
         IO.iodata_to_binary(mod.encode_iodata_elixir(msg))
 
       {schema, _has_custom_defaults?} ->
-        if :erlang.external_size(msg) >= @dirty_threshold do
-          NIF.nif_encode_struct_dirty(schema, msg)
-        else
-          NIF.nif_encode_struct(schema, msg)
+        case NIF.nif_encode_struct(schema, msg) do
+          :dirty -> NIF.nif_encode_struct_dirty(schema, msg)
+          bin -> bin
         end
     end
   end

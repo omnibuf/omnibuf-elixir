@@ -42,6 +42,14 @@ defmodule OmniBuf.SchemaTest do
     field(8, :i32_map, {:map, :int32, :string})
   end
 
+  defmodule BudgetSchema do
+    use OmniBuf.Schema, name: "BudgetSchema"
+
+    field(1, :raw, :bytes)
+    field(2, :items, {:array, :uint32})
+    field(3, :entries, {:map, :uint32, :uint32})
+  end
+
   setup do
     prev = Native.enabled?()
 
@@ -309,13 +317,53 @@ defmodule OmniBuf.SchemaTest do
 
     test "large struct encode uses dirty-CPU NIF cleanly" do
       if Native.loaded?() do
-        big = %PeerUpdate{asn: 7, router_id: String.duplicate("a", 40_000), active: true}
+        big = %PeerUpdate{asn: 7, router_id: String.duplicate("a", 300_000), active: true}
         :ok = Native.set_enabled(false)
         elx_bin = PeerUpdate.encode(big)
 
         :ok = Native.set_enabled(true)
         nif_bin = PeerUpdate.encode(big)
         assert nif_bin == elx_bin
+      end
+    end
+
+    test "normal-scheduler encode handles 40 KB payloads and bails to dirty-CPU past byte or element budgets" do
+      if Native.loaded?() do
+        schema =
+          NIF.nif_compile_schema([
+            {BudgetSchema,
+             [
+               {1, :raw, :bytes, false},
+               {2, :items, {:array, :uint32}, false},
+               {3, :entries, {:map, :uint32, :uint32}, false}
+             ]}
+          ])
+
+        medium = %BudgetSchema{raw: :binary.copy(<<0xAB>>, 40_000)}
+        at_elem_limit = %BudgetSchema{items: Enum.to_list(1..8_192)}
+        big_bytes = %BudgetSchema{raw: :binary.copy(<<0xCD>>, 262_145)}
+        big_array = %BudgetSchema{items: Enum.to_list(1..8_193)}
+        big_map = %BudgetSchema{entries: Map.new(1..8_193, &{&1, &1 * 2})}
+
+        # Normal-scheduler path encodes 40 KB and 8,192-elem payloads directly without yielding.
+        for msg <- [medium, at_elem_limit] do
+          :ok = Native.set_enabled(false)
+          elx_bin = BudgetSchema.encode(msg)
+
+          :ok = Native.set_enabled(true)
+          assert NIF.nif_encode_struct(schema, msg) == elx_bin
+          assert BudgetSchema.encode(msg) == elx_bin
+        end
+
+        # Payloads exceeding 256 KiB or 8,192 elements yield :dirty and match pure Elixir via dirty-CPU.
+        for msg <- [big_bytes, big_array, big_map] do
+          :ok = Native.set_enabled(false)
+          elx_bin = BudgetSchema.encode(msg)
+
+          :ok = Native.set_enabled(true)
+          assert NIF.nif_encode_struct(schema, msg) == :dirty
+          assert BudgetSchema.encode(msg) == elx_bin
+        end
       end
     end
 
