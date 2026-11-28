@@ -8,27 +8,33 @@
           "baseline": true,
           "highlight": true,
           "name": "OmniBuf (Rust NIF)",
-          "nsPerOp": 945,
-          "opsPerSec": 1058201,
+          "nsPerOp": 969,
+          "opsPerSec": 1031991,
           "wireBytes": 358
         },
         {
           "highlight": true,
           "name": "OmniBuf (Pure Elixir)",
-          "nsPerOp": 2276,
-          "opsPerSec": 439367,
+          "nsPerOp": 2315,
+          "opsPerSec": 431965,
           "wireBytes": 358
         },
         {
+          "name": "OTP :json (stdlib)",
+          "nsPerOp": 3522,
+          "opsPerSec": 283929,
+          "wireBytes": 803
+        },
+        {
           "name": "Jason (JSON)",
-          "nsPerOp": 4986,
-          "opsPerSec": 200561,
+          "nsPerOp": 4908,
+          "opsPerSec": 203748,
           "wireBytes": 803
         },
         {
           "name": "elixir-protobuf",
-          "nsPerOp": 5942,
-          "opsPerSec": 168293,
+          "nsPerOp": 6209,
+          "opsPerSec": 161056,
           "wireBytes": 341
         }
       ],
@@ -42,24 +48,29 @@
           "baseline": true,
           "highlight": true,
           "name": "OmniBuf (Rust NIF)",
-          "nsPerOp": 1627,
-          "opsPerSec": 614628
+          "nsPerOp": 1557,
+          "opsPerSec": 642260
         },
         {
           "highlight": true,
           "name": "OmniBuf (Pure Elixir)",
-          "nsPerOp": 4503,
-          "opsPerSec": 222074
+          "nsPerOp": 4303,
+          "opsPerSec": 232396
         },
         {
           "name": "elixir-protobuf",
-          "nsPerOp": 4509,
-          "opsPerSec": 221778
+          "nsPerOp": 4307,
+          "opsPerSec": 232180
+        },
+        {
+          "name": "OTP :json (stdlib)",
+          "nsPerOp": 4531,
+          "opsPerSec": 220701
         },
         {
           "name": "Jason (JSON)",
-          "nsPerOp": 6179,
-          "opsPerSec": 161838
+          "nsPerOp": 5707,
+          "opsPerSec": 175223
         }
       ],
       "title": "Full Message Decode Speed",
@@ -72,24 +83,29 @@
           "baseline": true,
           "highlight": true,
           "name": "OmniBuf (Rust NIF)",
-          "nsPerOp": 423,
-          "opsPerSec": 2364066
+          "nsPerOp": 411,
+          "opsPerSec": 2433090
         },
         {
           "highlight": true,
           "name": "OmniBuf (Pure Elixir)",
-          "nsPerOp": 1574,
-          "opsPerSec": 635324
+          "nsPerOp": 1459,
+          "opsPerSec": 685400
         },
         {
           "name": "elixir-protobuf",
-          "nsPerOp": 4770,
-          "opsPerSec": 209643
+          "nsPerOp": 4333,
+          "opsPerSec": 230786
+        },
+        {
+          "name": "OTP :json (stdlib)",
+          "nsPerOp": 4645,
+          "opsPerSec": 215285
         },
         {
           "name": "Jason (JSON)",
-          "nsPerOp": 6274,
-          "opsPerSec": 159387
+          "nsPerOp": 5935,
+          "opsPerSec": 168491
         }
       ],
       "title": "Read a Single Nested Field",
@@ -102,24 +118,29 @@
           "baseline": true,
           "highlight": true,
           "name": "OmniBuf (Rust NIF)",
-          "nsPerOp": 618,
-          "opsPerSec": 1618122
+          "nsPerOp": 1242,
+          "opsPerSec": 805152
         },
         {
           "highlight": true,
           "name": "OmniBuf (Pure Elixir)",
-          "nsPerOp": 2650,
-          "opsPerSec": 377358
+          "nsPerOp": 4372,
+          "opsPerSec": 228728
+        },
+        {
+          "name": "OTP :json (stdlib)",
+          "nsPerOp": 9835,
+          "opsPerSec": 101677
         },
         {
           "name": "elixir-protobuf",
-          "nsPerOp": 10999,
-          "opsPerSec": 90917
+          "nsPerOp": 11408,
+          "opsPerSec": 87657
         },
         {
           "name": "Jason (JSON)",
-          "nsPerOp": 12050,
-          "opsPerSec": 82987
+          "nsPerOp": 12807,
+          "opsPerSec": 78082
         }
       ],
       "title": "Selective Single-Field Mutation",
@@ -129,30 +150,36 @@
       "id": "encode_nested_shift",
       "results": [
         {
-          "highlight": true,
-          "name": "OmniBuf (Pure Elixir)",
-          "nsPerOp": 2945,
-          "opsPerSec": 339558,
-          "wireBytes": 39250
-        },
-        {
           "baseline": true,
           "highlight": true,
           "name": "OmniBuf (Rust NIF)",
-          "nsPerOp": 2982,
-          "opsPerSec": 335345,
+          "nsPerOp": 3276,
+          "opsPerSec": 305250,
           "wireBytes": 39250
         },
         {
+          "highlight": true,
+          "name": "OmniBuf (Pure Elixir)",
+          "nsPerOp": 3391,
+          "opsPerSec": 294898,
+          "wireBytes": 39250
+        },
+        {
+          "name": "OTP :json (stdlib)",
+          "nsPerOp": 34398,
+          "opsPerSec": 29071,
+          "wireBytes": 39681
+        },
+        {
           "name": "Jason (JSON)",
-          "nsPerOp": 83265,
-          "opsPerSec": 12009,
+          "nsPerOp": 87209,
+          "opsPerSec": 11466,
           "wireBytes": 39681
         },
         {
           "name": "elixir-protobuf",
-          "nsPerOp": 105716,
-          "opsPerSec": 9459,
+          "nsPerOp": 114033,
+          "opsPerSec": 8769,
           "wireBytes": 39227
         }
       ],
@@ -166,24 +193,29 @@
           "baseline": true,
           "highlight": true,
           "name": "OmniBuf (Rust NIF)",
-          "nsPerOp": 4972,
-          "opsPerSec": 201126
+          "nsPerOp": 5029,
+          "opsPerSec": 198846
         },
         {
           "highlight": true,
           "name": "OmniBuf (Pure Elixir)",
-          "nsPerOp": 6386,
-          "opsPerSec": 156592
+          "nsPerOp": 6442,
+          "opsPerSec": 155231
+        },
+        {
+          "name": "OTP :json (stdlib)",
+          "nsPerOp": 53080,
+          "opsPerSec": 18839
         },
         {
           "name": "Jason (JSON)",
-          "nsPerOp": 90588,
-          "opsPerSec": 11038
+          "nsPerOp": 85914,
+          "opsPerSec": 11639
         },
         {
           "name": "elixir-protobuf",
-          "nsPerOp": 104248,
-          "opsPerSec": 9592
+          "nsPerOp": 103810,
+          "opsPerSec": 9632
         }
       ],
       "title": "Embedded Message Growth",

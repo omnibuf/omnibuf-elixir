@@ -15,6 +15,7 @@ defmodule OmniBuf.Bench.PeerBench do
     schema_bytes = S.PeerUpdate.encode(schema_msg)
     pb_bytes = PB.PeerUpdate.encode(pb_msg)
     json_bytes = Jason.encode!(json_map)
+    otp_json_bytes = json_map |> :json.encode() |> IO.iodata_to_binary()
 
     # Minimal Prefix-Varint length prefixes produce 358 bytes (vs 366 with 2-byte backpatched slots)
     if byte_size(omnibuf_bytes) != 358 do
@@ -36,15 +37,20 @@ defmodule OmniBuf.Bench.PeerBench do
     decoded_pb = PB.PeerUpdate.decode(pb_bytes)
     ^pb_bytes = PB.PeerUpdate.encode(decoded_pb)
     _ = Jason.decode!(json_bytes)
+    _ = :json.decode(otp_json_bytes)
 
     # Verify Opaque lookup & splice
     op = PeerUpdate.Opaque.new(omnibuf_bytes)
     "Frankfurt" = op |> PeerUpdate.Opaque.get_location() |> Location.Opaque.get_city()
 
     spliced =
-      op
-      |> PeerUpdate.Opaque.set_sequence(PeerUpdate.Opaque.get_sequence(op) + 1)
-      |> PeerUpdate.Opaque.marshal!()
+      if op |> PeerUpdate.Opaque.get_location() |> Location.Opaque.get_city() == "Frankfurt" do
+        op
+        |> PeerUpdate.Opaque.set_sequence(PeerUpdate.Opaque.get_sequence(op) + 1)
+        |> PeerUpdate.Opaque.marshal!()
+      else
+        PeerUpdate.Opaque.marshal!(op)
+      end
 
     {:ok, %{sequence: 9_876_543_211}} = PeerUpdate.decode(spliced)
 
@@ -82,6 +88,7 @@ defmodule OmniBuf.Bench.PeerBench do
     ^gen_shift_bytes = S.PeerUpdate.encode(schema_shift)
     pb_shift_bytes = PB.PeerUpdate.encode(pb_shift)
     json_shift_bytes = Jason.encode!(json_shift)
+    otp_json_shift_bytes = json_shift |> :json.encode() |> IO.iodata_to_binary()
 
     # Category 6: Embedded Message Growth (32 neighbors trailing location -> >16 KiB growth)
     routing_neighbors_gen = List.flatten(List.duplicate(gen_msg.neighbors, 8))
@@ -97,6 +104,7 @@ defmodule OmniBuf.Bench.PeerBench do
     }
 
     routing_json_bytes = Jason.encode!(routing_json)
+    routing_otp_json_bytes = routing_json |> :json.encode() |> IO.iodata_to_binary()
 
     grown_dc = String.duplicate("d", 20_480)
 
@@ -145,6 +153,9 @@ defmodule OmniBuf.Bench.PeerBench do
             measure("elixir-protobuf", byte_size(pb_bytes), false, false, fn ->
               PB.PeerUpdate.encode(pb_msg)
             end),
+            measure("OTP :json (stdlib)", byte_size(otp_json_bytes), false, false, fn ->
+              json_map |> :json.encode() |> IO.iodata_to_binary()
+            end),
             measure("Jason (JSON)", byte_size(json_bytes), false, false, fn ->
               Jason.encode!(json_map)
             end)
@@ -171,6 +182,9 @@ defmodule OmniBuf.Bench.PeerBench do
             ),
             measure("elixir-protobuf", nil, false, false, fn ->
               PB.PeerUpdate.decode(pb_bytes)
+            end),
+            measure("OTP :json (stdlib)", nil, false, false, fn ->
+              :json.decode(otp_json_bytes)
             end),
             measure("Jason (JSON)", nil, false, false, fn ->
               Jason.decode!(json_bytes)
@@ -205,6 +219,9 @@ defmodule OmniBuf.Bench.PeerBench do
             measure("elixir-protobuf", nil, false, false, fn ->
               PB.PeerUpdate.decode(pb_bytes).location.city
             end),
+            measure("OTP :json (stdlib)", nil, false, false, fn ->
+              :json.decode(otp_json_bytes)["location"]["city"]
+            end),
             measure("Jason (JSON)", nil, false, false, fn ->
               Jason.decode!(json_bytes)["location"]["city"]
             end)
@@ -216,8 +233,17 @@ defmodule OmniBuf.Bench.PeerBench do
         maybe_native(native_loaded?, fn ->
           measure_mode(true, "OmniBuf (Rust NIF)", nil, true, true, fn ->
             view = PeerUpdate.Opaque.new(omnibuf_bytes)
-            seq = PeerUpdate.Opaque.get_sequence(view) + 1
-            view |> PeerUpdate.Opaque.set_sequence(seq) |> PeerUpdate.Opaque.marshal!()
+
+            view =
+              if view |> PeerUpdate.Opaque.get_location() |> Location.Opaque.get_city() ==
+                   "Frankfurt" do
+                seq = PeerUpdate.Opaque.get_sequence(view) + 1
+                PeerUpdate.Opaque.set_sequence(view, seq)
+              else
+                view
+              end
+
+            PeerUpdate.Opaque.marshal!(view)
           end)
         end) ++
           [
@@ -229,17 +255,54 @@ defmodule OmniBuf.Bench.PeerBench do
               not native_loaded?,
               fn ->
                 view = PeerUpdate.Opaque.new(omnibuf_bytes)
-                seq = PeerUpdate.Opaque.get_sequence(view) + 1
-                view |> PeerUpdate.Opaque.set_sequence(seq) |> PeerUpdate.Opaque.marshal!()
+
+                view =
+                  if view |> PeerUpdate.Opaque.get_location() |> Location.Opaque.get_city() ==
+                       "Frankfurt" do
+                    seq = PeerUpdate.Opaque.get_sequence(view) + 1
+                    PeerUpdate.Opaque.set_sequence(view, seq)
+                  else
+                    view
+                  end
+
+                PeerUpdate.Opaque.marshal!(view)
               end
             ),
             measure("elixir-protobuf", nil, false, false, fn ->
               m = PB.PeerUpdate.decode(pb_bytes)
-              PB.PeerUpdate.encode(%{m | sequence: m.sequence + 1})
+
+              m =
+                if m.location.city == "Frankfurt" do
+                  %{m | sequence: m.sequence + 1}
+                else
+                  m
+                end
+
+              PB.PeerUpdate.encode(m)
+            end),
+            measure("OTP :json (stdlib)", nil, false, false, fn ->
+              m = :json.decode(otp_json_bytes)
+
+              m =
+                if m["location"]["city"] == "Frankfurt" do
+                  %{m | "sequence" => m["sequence"] + 1}
+                else
+                  m
+                end
+
+              m |> :json.encode() |> IO.iodata_to_binary()
             end),
             measure("Jason (JSON)", nil, false, false, fn ->
               m = Jason.decode!(json_bytes)
-              Jason.encode!(%{m | "sequence" => m["sequence"] + 1})
+
+              m =
+                if m["location"]["city"] == "Frankfurt" do
+                  %{m | "sequence" => m["sequence"] + 1}
+                else
+                  m
+                end
+
+              Jason.encode!(m)
             end)
           ]
       ),
@@ -264,6 +327,9 @@ defmodule OmniBuf.Bench.PeerBench do
             ),
             measure("elixir-protobuf", byte_size(pb_shift_bytes), false, false, fn ->
               PB.PeerUpdate.encode(pb_shift)
+            end),
+            measure("OTP :json (stdlib)", byte_size(otp_json_shift_bytes), false, false, fn ->
+              json_shift |> :json.encode() |> IO.iodata_to_binary()
             end),
             measure("Jason (JSON)", byte_size(json_shift_bytes), false, false, fn ->
               Jason.encode!(json_shift)
@@ -316,6 +382,11 @@ defmodule OmniBuf.Bench.PeerBench do
             measure("elixir-protobuf", nil, false, false, fn ->
               m = PB.PeerUpdate.decode(routing_pb_bytes)
               PB.PeerUpdate.encode(%{m | location: %{m.location | datacenter: grown_dc}})
+            end),
+            measure("OTP :json (stdlib)", nil, false, false, fn ->
+              m = :json.decode(routing_otp_json_bytes)
+              updated = %{m | "location" => %{m["location"] | "datacenter" => grown_dc}}
+              updated |> :json.encode() |> IO.iodata_to_binary()
             end),
             measure("Jason (JSON)", nil, false, false, fn ->
               m = Jason.decode!(routing_json_bytes)
